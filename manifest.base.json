@@ -17,10 +17,8 @@
 	"web_accessible_resources": [
 		{
 			"resources": [
-				"dist/showdown.js",
-				"dist/lib-react.js",
-				"dist/react.js",
-				"dist/react.css"
+				"dist/*.js",
+				"dist/*.css"
 			],
 			"matches": ["*://play.pokemonshowdown.com/*", "*://*.psim.us/*"]
 		}

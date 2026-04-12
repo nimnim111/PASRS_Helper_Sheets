@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const outputDir = resolve(__dirname, 'output');
+const distDir = resolve(outputDir, 'dist');
 const manifestPath = resolve(__dirname, 'manifest.base.json');
 const packageJsonPath = resolve(__dirname, 'package.json');
 const iconPath = resolve(__dirname, '128.png');
@@ -17,10 +18,106 @@ const iconPath = resolve(__dirname, '128.png');
 const FIREFOX_ID =
 	'"gecko": {"id": "pasrs-helper@malaow3.com","strict_min_version": "109.0"}';
 
+function getProvidedChunkIds(code) {
+	const match = code.match(/\.push\(\[\[([^\]]+)\],/);
+	if (!match) {
+		return [];
+	}
+
+	return match[1]
+		.split(',')
+		.map((chunkId) => chunkId.replace(/["'\s]/g, ''))
+		.filter(Boolean);
+}
+
+function getRequiredChunkIds(code) {
+	const ids = [];
+
+	for (const match of code.matchAll(/\.O\(void 0,\[([^\]]+)\],function\(\)\{return [^}]+\}\)/g)) {
+		ids.push(
+			...match[1]
+				.split(',')
+				.map((chunkId) => chunkId.replace(/["'\s]/g, ''))
+				.filter(Boolean),
+		);
+	}
+
+	return [...new Set(ids)];
+}
+
+function getInjectedScriptFiles() {
+	const jsFiles = readdirSync(distDir).filter(
+		(file) => file.endsWith('.js') && !file.endsWith('.LICENSE.txt'),
+	);
+	const codeByFile = new Map(
+		jsFiles.map((file) => [file, readFileSync(resolve(distDir, file), 'utf-8')]),
+	);
+	const chunkIdToFile = new Map();
+
+	for (const [file, code] of codeByFile.entries()) {
+		for (const chunkId of getProvidedChunkIds(code)) {
+			chunkIdToFile.set(chunkId, file);
+		}
+	}
+
+	const orderedScripts = [];
+	const addScript = (file) => {
+		if (
+			!file ||
+			file === 'extension.js' ||
+			orderedScripts.includes(file)
+		) {
+			return;
+		}
+
+		orderedScripts.push(file);
+	};
+
+	for (const entryFile of ['react.js', 'showdown.js']) {
+		const code = codeByFile.get(entryFile);
+		if (!code) {
+			continue;
+		}
+
+		for (const chunkId of getRequiredChunkIds(code)) {
+			addScript(chunkIdToFile.get(chunkId));
+		}
+	}
+
+	for (const file of [...jsFiles].sort()) {
+		if (!['extension.js', 'react.js', 'showdown.js'].includes(file)) {
+			addScript(file);
+		}
+	}
+
+	addScript('react.js');
+	addScript('showdown.js');
+
+	return orderedScripts;
+}
+
+function writeExtensionLoader() {
+	const scriptFiles = getInjectedScriptFiles();
+	const reactScripts = scriptFiles.filter((file) => file !== 'showdown.js');
+	const showdownScript = scriptFiles.find((file) => file === 'showdown.js');
+	const output = [
+		'(()=>{',
+			'const injectScript=(file)=>{const script=document.createElement("script");script.src=chrome.runtime.getURL(file);script.onload=()=>script.remove();(document.head||document.documentElement).append(script);};',
+			'const injectStyle=(file)=>{const style=document.createElement("link");style.rel="stylesheet";style.href=chrome.runtime.getURL(file);(document.head||document.documentElement).append(style);};',
+			...reactScripts.map((file) => `injectScript(${JSON.stringify(`dist/${file}`)});`),
+			'injectStyle("dist/react.css");',
+			...(showdownScript ? [`injectScript(${JSON.stringify(`dist/${showdownScript}`)});`] : []),
+		'})();',
+	].join('');
+
+	writeFileSync(resolve(distDir, 'extension.js'), output);
+}
+
 function build(target = 'chrome') {
 	console.log(`Building for ${target}...`);
 
 	execSync('rsbuild build', { cwd: __dirname, stdio: 'inherit' });
+	writeExtensionLoader();
 
 	const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
 	const { version } = JSON.parse(readFileSync(packageJsonPath, 'utf-8'));
