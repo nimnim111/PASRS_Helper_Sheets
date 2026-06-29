@@ -238,10 +238,15 @@ app.receive = (data: string) => {
 				}
 
 				if (settings.log_to_sheets) {
-					const replay = replaysManager.getReplay(roomId);
-					if (replay) {
+					const spreadsheetId = settings.sheets_spreadsheet_id;
+					// Defer slightly: the post-game rating (Elo) message arrives a
+					// moment after the replay is finalized, so wait for it to be
+					// merged into the replay before reading it.
+					setTimeout(() => {
+						const replay = replaysManager.getReplay(roomId);
+						if (!replay) return;
 						sheetsRequest('log', {
-							spreadsheetId: settings.sheets_spreadsheet_id,
+							spreadsheetId,
 							payload: buildGbgPayload(replay),
 						}).then((response) => {
 							if (!response.ok) {
@@ -251,7 +256,7 @@ app.receive = (data: string) => {
 								);
 							}
 						});
-					}
+					}, 3000);
 				}
 
 				replaysManager.setRoomState(roomId, ReplayRoomState.Recorded);
