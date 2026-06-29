@@ -118,6 +118,24 @@ async function createFromTemplate(token: string): Promise<string> {
 	return json.id;
 }
 
+// Whether the stored spreadsheet still exists and isn't in the trash. A trashed
+// file is still readable by ID via the Sheets API, so we check Drive explicitly
+// (drive.file can see files the app created).
+async function isLiveFile(
+	tokenRef: TokenRef,
+	spreadsheetId: string,
+): Promise<boolean> {
+	const response = await fetchWithRetry('Drive get', () =>
+		fetch(
+			`https://www.googleapis.com/drive/v3/files/${spreadsheetId}?fields=trashed`,
+			{ headers: { Authorization: `Bearer ${tokenRef.token}` } },
+		),
+	);
+	if (!response.ok) return false; // 404 / no access -> treat as gone
+	const json = (await response.json()) as { trashed?: boolean };
+	return json.trashed !== true;
+}
+
 // Whether the spreadsheet contains a "GBG Data" sheet (i.e. it's a PASRS
 // tracker). Returns false if the spreadsheet is missing/inaccessible.
 async function hasGbgSheet(
@@ -159,7 +177,13 @@ async function ensureSpreadsheetId(
 	}
 
 	const stored = await getStoredSpreadsheetId();
-	if (stored && (await hasGbgSheet(tokenRef, stored))) return stored;
+	if (
+		stored &&
+		(await isLiveFile(tokenRef, stored)) &&
+		(await hasGbgSheet(tokenRef, stored))
+	) {
+		return stored;
+	}
 
 	const created = await createFromTemplate(tokenRef.token);
 	await setStoredSpreadsheetId(created);
