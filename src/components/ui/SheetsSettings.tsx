@@ -78,6 +78,7 @@ export function SheetsSettings({
 	const [signedIn, setSignedIn] = useState(false);
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState('');
+	const [status, setStatus] = useState('');
 	const [sheetUrl, setSheetUrl] = useState('');
 
 	const refreshSheet = useCallback(() => {
@@ -117,6 +118,30 @@ export function SheetsSettings({
 		setSignedIn(false);
 	};
 
+	const handleTestRow = async (): Promise<void> => {
+		setBusy(true);
+		setError('');
+		setStatus('');
+		const res = await sheetsRequest('log', {
+			spreadsheetId,
+			sheetName,
+			payload: {
+				format: 'TEST',
+				p1: 'You',
+				p2: 'Opponent',
+				result: 'win',
+				url: 'https://replay.pokemonshowdown.com/test',
+			},
+		});
+		setBusy(false);
+		if (res.ok) {
+			setStatus('Test row added.');
+			if (res.spreadsheetUrl) setSheetUrl(res.spreadsheetUrl);
+		} else {
+			setError(res.error || 'Failed to add test row');
+		}
+	};
+
 	return (
 		<>
 			<SettingsCheckbox
@@ -143,6 +168,15 @@ export function SheetsSettings({
 				<StatusText $signedIn={signedIn}>
 					{signedIn ? 'Signed in' : 'Not signed in'}
 				</StatusText>
+				{signedIn && (
+					<AuthButton
+						type="button"
+						onClick={handleTestRow}
+						disabled={busy || !logToSheets}
+					>
+						Send test row
+					</AuthButton>
+				)}
 			</AuthRow>
 
 			<SettingsTextInput
@@ -174,6 +208,7 @@ export function SheetsSettings({
 				)}
 			</HintText>
 
+			{status && <HintText>{status}</HintText>}
 			{error && <ErrorText>{error}</ErrorText>}
 
 			<GuideLink
