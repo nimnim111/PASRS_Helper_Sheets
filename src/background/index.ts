@@ -104,7 +104,27 @@ interface TeamTabMeta {
 interface SpreadsheetMeta {
 	teamCount: number;
 	teams: Record<string, TeamTabMeta>; // keyed by sorted species set
+	// The auto-created spreadsheet's initial empty "Sheet1", deleted once the
+	// first team tab exists. Only set for spreadsheets we created.
+	defaultSheetId?: number;
+	defaultSheetDeleted?: boolean;
 }
+
+type Color = { red: number; green: number; blue: number };
+
+// Palette for the styled tabs.
+const TITLE_BG: Color = { red: 0.12, green: 0.2, blue: 0.33 };
+const HEADER_BG: Color = { red: 0.17, green: 0.24, blue: 0.31 };
+const WHITE: Color = { red: 1, green: 1, blue: 1 };
+const WIN_BG: Color = { red: 0.78, green: 0.92, blue: 0.79 };
+const WIN_FG: Color = { red: 0.0, green: 0.38, blue: 0.0 };
+const LOSS_BG: Color = { red: 0.99, green: 0.8, blue: 0.8 };
+const LOSS_FG: Color = { red: 0.6, green: 0.0, blue: 0.0 };
+
+// Pixel widths for the 10 battle columns (A–J).
+const COLUMN_WIDTHS = [170, 150, 120, 150, 70, 80, 95, 80, 230, 260];
+const MON_ROW_HEIGHT = 72;
+const SPRITE_PX = 64;
 
 type AllMeta = Record<string, SpreadsheetMeta>; // keyed by spreadsheet id
 
@@ -235,19 +255,30 @@ async function writeRange(
 }
 
 // Create a fresh, empty spreadsheet (team tabs are added as battles arrive).
-async function createSpreadsheet(tokenRef: TokenRef): Promise<string> {
+async function createSpreadsheet(
+	tokenRef: TokenRef,
+): Promise<{ id: string; defaultSheetId?: number }> {
 	const response = await sheetsCall(tokenRef, '', 'POST', {
 		properties: { title: SPREADSHEET_TITLE },
 	});
 	await expectOk(response);
-	const json = (await response.json()) as { spreadsheetId: string };
-	return json.spreadsheetId;
+	const json = (await response.json()) as {
+		spreadsheetId: string;
+		sheets?: Array<{ properties?: { sheetId?: number } }>;
+	};
+	return {
+		id: json.spreadsheetId,
+		defaultSheetId: json.sheets?.[0]?.properties?.sheetId,
+	};
 }
 
 // Resolve which spreadsheet to write to: the user's own ID if provided,
-// otherwise the remembered auto-created one, creating it on first use.
+// otherwise the remembered auto-created one, creating it on first use. When a
+// new one is created, its empty default sheet id is recorded in meta so the
+// first team tab can delete it.
 async function ensureSpreadsheetId(
 	tokenRef: TokenRef,
+	allMeta: AllMeta,
 	userProvidedId?: string,
 ): Promise<string> {
 	const provided = userProvidedId?.trim();
@@ -257,8 +288,13 @@ async function ensureSpreadsheetId(
 	if (stored) return stored;
 
 	const created = await createSpreadsheet(tokenRef);
-	await setStoredSpreadsheetId(created);
-	return created;
+	await setStoredSpreadsheetId(created.id);
+	allMeta[created.id] = {
+		teamCount: 0,
+		teams: {},
+		defaultSheetId: created.defaultSheetId,
+	};
+	return created.id;
 }
 
 function speciesKeyOf(species: string[]): string {
@@ -269,18 +305,153 @@ function speciesKeyOf(species: string[]): string {
 		.join('|');
 }
 
-// Header block placed at the top of a new team tab: the team, then the battle
-// column headers. Kept contiguous (no blank rows) so append() finds the table.
+// Header block placed at the top of a new team tab: the team (with a sprite
+// column), then the battle column headers. Kept contiguous (no blank rows) so
+// append() finds the table.
 function teamHeaderRows(tabName: string, team: TeamMon[]): string[][] {
 	const rows: string[][] = [[tabName]];
 	if (team.length > 0) {
-		rows.push(['Pokémon', 'Item', 'Moves']);
+		rows.push(['Pokémon', 'Sprite', 'Item', 'Moves']);
 		for (const mon of team) {
-			rows.push([mon.species, mon.item, mon.moves]);
+			const image = mon.sprite
+				? `=IMAGE("${mon.sprite}", 4, ${SPRITE_PX}, ${SPRITE_PX})`
+				: '';
+			rows.push([mon.species, image, mon.item, mon.moves]);
 		}
 	}
 	rows.push([...BATTLE_COLUMNS]);
 	return rows;
+}
+
+function headerRowFormat(
+	sheetId: number,
+	rowIndex: number,
+	columns: number,
+	background: Color,
+	fontSize?: number,
+): unknown {
+	return {
+		repeatCell: {
+			range: {
+				sheetId,
+				startRowIndex: rowIndex,
+				endRowIndex: rowIndex + 1,
+				startColumnIndex: 0,
+				endColumnIndex: columns,
+			},
+			cell: {
+				userEnteredFormat: {
+					backgroundColor: background,
+					verticalAlignment: 'MIDDLE',
+					textFormat: {
+						bold: true,
+						foregroundColor: WHITE,
+						...(fontSize ? { fontSize } : {}),
+					},
+				},
+			},
+			fields: 'userEnteredFormat(backgroundColor,verticalAlignment,textFormat)',
+		},
+	};
+}
+
+function resultColorRule(
+	sheetId: number,
+	firstBattleRow: number,
+	value: string,
+	background: Color,
+	foreground: Color,
+): unknown {
+	return {
+		addConditionalFormatRule: {
+			index: 0,
+			rule: {
+				ranges: [
+					{
+						sheetId,
+						startRowIndex: firstBattleRow,
+						startColumnIndex: 4, // Result column (E)
+						endColumnIndex: 5,
+					},
+				],
+				booleanRule: {
+					condition: {
+						type: 'TEXT_EQ',
+						values: [{ userEnteredValue: value }],
+					},
+					format: {
+						backgroundColor: background,
+						textFormat: { foregroundColor: foreground },
+					},
+				},
+			},
+		},
+	};
+}
+
+// Build the formatting batchUpdate for a freshly created team tab.
+function tabFormatRequests(
+	sheetId: number,
+	team: TeamMon[],
+): { requests: unknown[]; battleHeaderRowIndex: number } {
+	const hasTeam = team.length > 0;
+	const battleHeaderRowIndex = hasTeam ? 2 + team.length : 1;
+	const cols = BATTLE_COLUMNS.length;
+
+	const requests: unknown[] = [
+		headerRowFormat(sheetId, 0, cols, TITLE_BG, 13),
+		headerRowFormat(sheetId, battleHeaderRowIndex, cols, HEADER_BG),
+		{
+			updateSheetProperties: {
+				properties: {
+					sheetId,
+					gridProperties: { frozenRowCount: battleHeaderRowIndex + 1 },
+				},
+				fields: 'gridProperties.frozenRowCount',
+			},
+		},
+		resultColorRule(sheetId, battleHeaderRowIndex + 1, 'win', WIN_BG, WIN_FG),
+		resultColorRule(
+			sheetId,
+			battleHeaderRowIndex + 1,
+			'loss',
+			LOSS_BG,
+			LOSS_FG,
+		),
+	];
+
+	COLUMN_WIDTHS.forEach((width, index) => {
+		requests.push({
+			updateDimensionProperties: {
+				range: {
+					sheetId,
+					dimension: 'COLUMNS',
+					startIndex: index,
+					endIndex: index + 1,
+				},
+				properties: { pixelSize: width },
+				fields: 'pixelSize',
+			},
+		});
+	});
+
+	if (hasTeam) {
+		requests.push(headerRowFormat(sheetId, 1, 4, HEADER_BG));
+		requests.push({
+			updateDimensionProperties: {
+				range: {
+					sheetId,
+					dimension: 'ROWS',
+					startIndex: 2,
+					endIndex: 2 + team.length,
+				},
+				properties: { pixelSize: MON_ROW_HEIGHT },
+				fields: 'pixelSize',
+			},
+		});
+	}
+
+	return { requests, battleHeaderRowIndex };
 }
 
 async function createTeamTab(
@@ -288,21 +459,53 @@ async function createTeamTab(
 	spreadsheetId: string,
 	tabName: string,
 	team: TeamMon[],
+	meta: SpreadsheetMeta,
 ): Promise<void> {
+	// Add the tab and, for auto-created spreadsheets, drop the stray empty
+	// default sheet in the same batch.
+	const requests: unknown[] = [
+		{ addSheet: { properties: { title: tabName } } },
+	];
+	const deletingDefault =
+		meta.defaultSheetId != null && !meta.defaultSheetDeleted;
+	if (deletingDefault) {
+		requests.push({ deleteSheet: { sheetId: meta.defaultSheetId } });
+	}
+
 	const addRes = await sheetsCall(
 		tokenRef,
 		`${spreadsheetId}:batchUpdate`,
 		'POST',
-		{ requests: [{ addSheet: { properties: { title: tabName } } }] },
+		{ requests },
 	);
-	// Ignore "already exists" (400) so a previously half-created tab still works.
-	if (!addRes.ok && addRes.status !== 400) await expectOk(addRes);
+	// "Already exists" (400): the tab is there but we can't get its id, so just
+	// leave it as-is (appends still work) without clobbering existing content.
+	if (!addRes.ok) {
+		if (addRes.status !== 400) await expectOk(addRes);
+		return;
+	}
+	if (deletingDefault) meta.defaultSheetDeleted = true;
+
+	const replies = (await addRes.json()) as {
+		replies?: Array<{ addSheet?: { properties?: { sheetId?: number } } }>;
+	};
+	const sheetId = replies.replies?.[0]?.addSheet?.properties?.sheetId;
+
 	await writeRange(
 		tokenRef,
 		spreadsheetId,
 		tabName,
 		teamHeaderRows(tabName, team),
 	);
+
+	if (sheetId != null) {
+		const { requests: formatRequests } = tabFormatRequests(sheetId, team);
+		await expectOk(
+			await sheetsCall(tokenRef, `${spreadsheetId}:batchUpdate`, 'POST', {
+				requests: formatRequests,
+			}),
+		);
+	}
 }
 
 // Describe item/move changes between two snapshots of the same species set.
@@ -346,22 +549,23 @@ async function handleLog(data?: SheetsRequestData): Promise<SheetsResponse> {
 	const tokenRef: TokenRef = { token: initialToken };
 
 	try {
+		const allMeta = await getAllMeta();
 		const spreadsheetId = await ensureSpreadsheetId(
 			tokenRef,
+			allMeta,
 			data?.spreadsheetId,
 		);
 
 		const team = payload.myTeam ?? [];
 		const key = speciesKeyOf(payload.myTeamSpecies ?? []);
 
-		const allMeta = await getAllMeta();
 		const meta = allMeta[spreadsheetId] ?? { teamCount: 0, teams: {} };
 		let teamMeta = meta.teams[key];
 
 		if (!teamMeta) {
 			meta.teamCount += 1;
 			const tabName = `Team ${meta.teamCount}`;
-			await createTeamTab(tokenRef, spreadsheetId, tabName, team);
+			await createTeamTab(tokenRef, spreadsheetId, tabName, team, meta);
 			teamMeta = { tabName, detail: team };
 			meta.teams[key] = teamMeta;
 		} else {

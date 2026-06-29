@@ -137,8 +137,16 @@ export function SheetsSettings({
 						species: 'Calyrex-Shadow',
 						item: 'Focus Sash',
 						moves: 'Astral Barrage',
+						sprite:
+							'https://play.pokemonshowdown.com/sprites/home/calyrex-shadow.png',
 					},
-					{ species: 'Miraidon', item: 'Choice Specs', moves: 'Electro Drift' },
+					{
+						species: 'Miraidon',
+						item: 'Choice Specs',
+						moves: 'Electro Drift',
+						sprite:
+							'https://play.pokemonshowdown.com/sprites/home/miraidon.png',
+					},
 				],
 				myTeamSpecies: ['Calyrex-Shadow', 'Miraidon'],
 				oppTeamSpecies: ['Koraidon', 'Flutter Mane'],

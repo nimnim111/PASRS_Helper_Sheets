@@ -2,6 +2,7 @@ export interface TeamMon {
 	species: string;
 	item: string;
 	moves: string;
+	sprite: string; // sprite image URL (empty if unknown)
 }
 
 export interface RoomReplay {

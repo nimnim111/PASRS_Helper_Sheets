@@ -7,8 +7,25 @@ declare const Dex:
 	| {
 			items?: { get?: (id: string) => { name?: string } };
 			moves?: { get?: (id: string) => { name?: string } };
+			species?: { get?: (id: string) => { spriteid?: string } };
 	  }
 	| undefined;
+
+// Pokémon HOME official artwork; covers modern (gen 8/9) species as static PNGs.
+const SPRITE_BASE = 'https://play.pokemonshowdown.com/sprites/home';
+
+function spriteUrl(species: string): string {
+	if (!species) return '';
+	let id = '';
+	try {
+		id = Dex?.species?.get?.(species)?.spriteid ?? '';
+	} catch {
+		id = '';
+	}
+	// Fallback id: lowercase, drop spaces/apostrophes/periods, keep forme hyphens.
+	if (!id) id = species.toLowerCase().replace(/[^a-z0-9-]/g, '');
+	return id ? `${SPRITE_BASE}/${id}.png` : '';
+}
 
 function prettyItem(id: string): string {
 	if (!id) return '';
@@ -85,7 +102,12 @@ export function parseRequestTeam(data: string): ParsedRequest | null {
 		const moves = Array.isArray(mon.moves)
 			? mon.moves.map(prettyMove).join(' / ')
 			: '';
-		return { species, item: prettyItem(mon.item ?? ''), moves };
+		return {
+			species,
+			item: prettyItem(mon.item ?? ''),
+			moves,
+			sprite: spriteUrl(species),
+		};
 	});
 
 	return {
