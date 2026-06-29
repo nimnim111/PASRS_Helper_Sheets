@@ -1,9 +1,20 @@
 import { ReplayRoomState } from '../../types/replay';
 import {
+	isPlayerMessage,
+	isRatingMessage,
+	isRequestMessage,
+	isTeamPreviewMessage,
+	parseOpponentSpecies,
+	parsePlayers,
+	parseRatingChange,
+	parseRequestTeam,
+} from '../../utils/showdown-battle-utils';
+import {
 	getFormatFromData,
 	getRoomIdFromData,
 	getRoomIdFromURL,
 	getUrlFromData,
+	getUserFromCookies,
 } from '../../utils/showdown-data-utils';
 import {
 	isBattleFormatMessage,
@@ -34,6 +45,65 @@ onSettingsUpdated((settings) => {
 	currentSettings = settings;
 });
 
+// Accumulate team / rating details from the battle protocol stream onto the
+// tracked replay, so they can be logged to Sheets when the replay is recorded.
+function collectBattleDetails(data: string): void {
+	const roomId = getRoomIdFromData(data);
+	if (!roomId || !replaysManager.hasRoom(roomId)) return;
+
+	if (isPlayerMessage(data)) {
+		const players = parsePlayers(data);
+		const user = getUserFromCookies();
+		let mySide: 'p1' | 'p2' | undefined;
+		if (user) {
+			if (players.p1.name?.toLowerCase() === user.toLowerCase()) mySide = 'p1';
+			else if (players.p2.name?.toLowerCase() === user.toLowerCase())
+				mySide = 'p2';
+		}
+		replaysManager.mergeReplay(roomId, {
+			mySide,
+			p1Elo: players.p1.rating,
+			p2Elo: players.p2.rating,
+		});
+	}
+
+	if (isRequestMessage(data)) {
+		const parsed = parseRequestTeam(data);
+		if (parsed) {
+			replaysManager.mergeReplay(roomId, {
+				mySide: parsed.side,
+				myTeam: parsed.team,
+				myTeamSpecies: parsed.species,
+			});
+		}
+	}
+
+	if (isTeamPreviewMessage(data)) {
+		const replay = replaysManager.getReplay(roomId);
+		if (replay?.mySide) {
+			const oppSide = replay.mySide === 'p1' ? 'p2' : 'p1';
+			const species = parseOpponentSpecies(data, oppSide);
+			if (species.length > 0) {
+				replaysManager.mergeReplay(roomId, { oppTeamSpecies: species });
+			}
+		}
+	}
+
+	if (isRatingMessage(data)) {
+		const user = getUserFromCookies();
+		if (user) {
+			const change = parseRatingChange(data, user);
+			if (change) {
+				replaysManager.mergeReplay(roomId, {
+					myEloBefore: change.before,
+					myEloAfter: change.after,
+					myEloDelta: change.delta,
+				});
+			}
+		}
+	}
+}
+
 app.receive = (data: string) => {
 	var settings = currentSettings;
 
@@ -52,6 +122,8 @@ app.receive = (data: string) => {
 	if (isBattleFormatMessage(data)) {
 		replaysManager.updateFormatReplay(data);
 	}
+
+	collectBattleDetails(data);
 
 	if (settings.vgc_only || settings.use_custom_replay_filter) {
 		const roomId = getRoomIdFromData(data);
@@ -106,6 +178,10 @@ app.receive = (data: string) => {
 				if (settings.log_to_sheets) {
 					const replay = replaysManager.getReplay(roomId);
 					if (replay) {
+						const oppElo = replay.mySide === 'p2' ? replay.p1Elo : replay.p2Elo;
+						const myEloBefore =
+							replay.myEloBefore ??
+							(replay.mySide === 'p2' ? replay.p2Elo : replay.p1Elo);
 						sheetsRequest('log', {
 							spreadsheetId: settings.sheets_spreadsheet_id,
 							sheetName: settings.sheets_sheet_name,
@@ -115,6 +191,14 @@ app.receive = (data: string) => {
 								p2: replay.p2,
 								result: replay.result,
 								url: replay.url,
+								mySide: replay.mySide,
+								myTeam: replay.myTeam,
+								myTeamSpecies: replay.myTeamSpecies,
+								oppTeamSpecies: replay.oppTeamSpecies,
+								myEloBefore,
+								myEloAfter: replay.myEloAfter,
+								myEloDelta: replay.myEloDelta,
+								oppElo,
 							},
 						}).then((response) => {
 							if (!response.ok) {

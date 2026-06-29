@@ -131,6 +131,21 @@ export function SheetsSettings({
 				p2: 'Opponent',
 				result: 'win',
 				url: 'https://replay.pokemonshowdown.com/test',
+				mySide: 'p1',
+				myTeam: [
+					{
+						species: 'Calyrex-Shadow',
+						item: 'Focus Sash',
+						moves: 'Astral Barrage',
+					},
+					{ species: 'Miraidon', item: 'Choice Specs', moves: 'Electro Drift' },
+				],
+				myTeamSpecies: ['Calyrex-Shadow', 'Miraidon'],
+				oppTeamSpecies: ['Koraidon', 'Flutter Mane'],
+				myEloBefore: '1500',
+				myEloAfter: '1516',
+				myEloDelta: '+16',
+				oppElo: '1490',
 			},
 		});
 		setBusy(false);

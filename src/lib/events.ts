@@ -1,4 +1,4 @@
-import type { RoomReplay } from '../types/replay';
+import type { RoomReplay, TeamMon } from '../types/replay';
 import type { Settings } from '../types/settings';
 
 // Cross-context RPC (page <-> content script) for Google Sheets logging.
@@ -24,6 +24,15 @@ export interface SheetsLogPayload {
 	p2: string;
 	result: string;
 	url: string;
+	// Battle details (optional; absent for unrated/unknown data).
+	mySide?: 'p1' | 'p2';
+	myTeam?: TeamMon[];
+	myTeamSpecies?: string[];
+	oppTeamSpecies?: string[];
+	myEloBefore?: string;
+	myEloAfter?: string;
+	myEloDelta?: string;
+	oppElo?: string;
 }
 
 export interface SheetsRequestData {

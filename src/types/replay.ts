@@ -1,3 +1,9 @@
+export interface TeamMon {
+	species: string;
+	item: string;
+	moves: string;
+}
+
 export interface RoomReplay {
 	id: string;
 	state: ReplayRoomState;
@@ -6,6 +12,16 @@ export interface RoomReplay {
 	p1: string;
 	p2: string;
 	result: ReplayRoomResult;
+	// Battle details collected from the protocol stream, used for Sheets logging.
+	mySide?: 'p1' | 'p2';
+	myTeam?: TeamMon[];
+	myTeamSpecies?: string[];
+	oppTeamSpecies?: string[];
+	p1Elo?: string;
+	p2Elo?: string;
+	myEloBefore?: string;
+	myEloAfter?: string;
+	myEloDelta?: string;
 }
 
 export enum ReplayRoomState {

@@ -156,6 +156,26 @@ export class ReplaysManager {
 		}
 	}
 
+	// Merge collected battle details (team, ratings, …) into a tracked room,
+	// skipping ignored rooms. Existing fields are only overwritten by defined
+	// values in the patch.
+	mergeReplay(roomId: string, patch: Partial<RoomReplay>): void {
+		if (!this.hasRoom(roomId)) return;
+		const replays = this.getReplays();
+		const replay = replays.find(
+			(r) => r.id === roomId && r.state !== ReplayRoomState.Ignored,
+		);
+		if (!replay) return;
+
+		const target = replay as unknown as Record<string, unknown>;
+		for (const [key, value] of Object.entries(patch)) {
+			if (value !== undefined) {
+				target[key] = value;
+			}
+		}
+		this.saveReplays(replays);
+	}
+
 	private initReplay(data: string): RoomReplay | null {
 		if (!data) return null;
 

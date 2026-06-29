@@ -17,7 +17,13 @@ the official Google Sheets API. Users sign in with their Google account from the
 settings panel; replay data goes directly from the extension to Google's API
 (no third party in between).
 
-Each recorded replay appends a row: `[timestamp, format, p1, p2, result, url]`.
+Replays are segmented by the team you played: each unique set of six species
+gets its own tab ("Team 1", "Team 2", …) with the team (species, item, moves)
+at the top, followed by a battle table. Columns: `Timestamp, Format, You,
+Opponent, Result, Your Elo, Elo Change, Opp Elo, Opp Team, Replay URL`. Keeping
+the same species but changing items/moves inserts a "Team updated" marker row in
+the same tab; changing a species starts a new tab. Elo columns are populated for
+rated games only.
 
 ### How it's wired (for contributors)
 The page-injected scripts cannot use `chrome.*`, and OAuth can only run in a
