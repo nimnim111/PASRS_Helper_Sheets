@@ -53,10 +53,13 @@ The extension ships with a placeholder `client_id` in `manifest.base.json`. To
 make sign-in work you must create your own OAuth client:
 
 1. In the [Google Cloud Console](https://console.cloud.google.com), create a
-   project and **enable the Google Sheets API** (APIs & Services → Library).
-2. Configure the **OAuth consent screen** (External). Add the scope
-   `https://www.googleapis.com/auth/spreadsheets`. While unverified, add yourself
-   under **Test users**.
+   project and **enable the Google Sheets API and the Google Drive API**
+   (APIs & Services → Library).
+2. Configure the **OAuth consent screen** (External). Add the scopes
+   `https://www.googleapis.com/auth/spreadsheets` and
+   `https://www.googleapis.com/auth/drive.file` (the latter lets the extension
+   create the tracker in the user's Drive). While unverified, add yourself under
+   **Test users**.
 3. Create an **OAuth client ID** of type **Web application** (the same single
    client works for all browsers).
 4. Add the extension's redirect URL(s) under **Authorized redirect URIs**. The
@@ -77,17 +80,20 @@ make sign-in work you must create your own OAuth client:
 > ~100 test users.
 
 ### User setup
-1. Make a copy of the **PASRS 4.3** spreadsheet in your own Google Drive (File →
-   Make a copy, or upload the `.xlsx` and open it as a Google Sheet). It must
-   contain the `GBG Data` sheet.
-2. Copy its **spreadsheet ID** from the URL
-   (`https://docs.google.com/spreadsheets/d/<THIS_PART>/edit`).
-3. In the PASRS Helper side panel → **Settings → Google Sheets**, enable
-   **Log recorded replays to Google Sheets**, click **Sign in with Google**, and
-   paste the spreadsheet ID.
+1. In the PASRS Helper side panel → **Settings → Google Sheets**, enable
+   **Log recorded replays to Google Sheets** and click **Sign in with Google**.
+2. Leave the **Spreadsheet ID** blank. On your first recorded battle the
+   extension uploads the bundled PASRS template to your Google Drive (converted
+   to a Google Sheet named "PASRS Helper Tracker") and reuses it after that. To
+   use an existing copy instead, paste its spreadsheet ID.
 
 From then on, each recorded battle appends a row to the `GBG Data` sheet and the
-template's dashboards update automatically.
+tracker's dashboards update automatically. The settings panel links to your
+tracker once it exists.
+
+The template is bundled as `pasrs-template.xlsx` and uploaded via the Drive API
+(`files.create`, multipart, converting to a Google Sheet). This only needs the
+`drive.file` scope because the extension is creating the file.
 
 ## Maintainers / Credits
 The project is maintained by the following individuals:<br>

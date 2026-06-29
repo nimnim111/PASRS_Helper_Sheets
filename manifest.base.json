@@ -10,11 +10,15 @@
 	"host_permissions": [
 		"*://*.pokemonshowdown.com/*",
 		"*://*.psim.us/*",
-		"https://sheets.googleapis.com/*"
+		"https://sheets.googleapis.com/*",
+		"https://www.googleapis.com/*"
 	],
 	"oauth2": {
 		"client_id": "399755851205-l7i2g4jrqbgv9a8lsrqe8drbo1lqdg19.apps.googleusercontent.com",
-		"scopes": ["https://www.googleapis.com/auth/spreadsheets"]
+		"scopes": [
+			"https://www.googleapis.com/auth/spreadsheets",
+			"https://www.googleapis.com/auth/drive.file"
+		]
 	},
 	"background": {
 		"service_worker": "dist/background.js"

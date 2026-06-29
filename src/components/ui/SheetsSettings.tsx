@@ -194,7 +194,7 @@ export function SheetsSettings({
 			<SettingsTextInput
 				settingsKey="sheets_spreadsheet_id"
 				value={spreadsheetId}
-				placeholder="PASRS spreadsheet ID"
+				placeholder="Spreadsheet ID (leave blank to auto-create)"
 				onChange={onTextChange}
 				disabled={!logToSheets}
 			/>
@@ -202,14 +202,14 @@ export function SheetsSettings({
 			<HintText>
 				{sheetUrl ? (
 					<>
-						Logging to the{' '}
+						Logging to your{' '}
 						<a href={sheetUrl} target="_blank" rel="noopener noreferrer">
-							GBG Data
-						</a>{' '}
-						sheet.
+							PASRS tracker
+						</a>
+						.
 					</>
 				) : (
-					'Upload the PASRS 4.3 template to Google Sheets and paste its spreadsheet ID (from the URL).'
+					'Leave blank and a PASRS tracker will be created in your Google Drive on your first battle. Or paste an existing copy’s ID.'
 				)}
 			</HintText>
 

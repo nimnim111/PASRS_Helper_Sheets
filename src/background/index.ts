@@ -73,6 +73,70 @@ async function setStoredSpreadsheetId(id: string): Promise<void> {
 	await chrome.storage.local.set({ [SPREADSHEET_STORAGE_KEY]: id });
 }
 
+const TEMPLATE_FILE = 'pasrs-template.xlsx';
+const SPREADSHEET_TITLE = 'PASRS Helper Tracker';
+const SHEET_MIME = 'application/vnd.google-apps.spreadsheet';
+const XLSX_MIME =
+	'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+// Auto-create the tracker by uploading the bundled PASRS template to the user's
+// Drive, converting it to a Google Sheet. Uses Drive's multipart upload; the
+// drive.file scope is enough because the app is creating the file.
+async function createFromTemplate(token: string): Promise<string> {
+	const fileBytes = await (
+		await fetch(chrome.runtime.getURL(TEMPLATE_FILE))
+	).blob();
+
+	const boundary = `pasrs${Date.now()}`;
+	const metadata = { name: SPREADSHEET_TITLE, mimeType: SHEET_MIME };
+	const body = new Blob([
+		`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n`,
+		JSON.stringify(metadata),
+		`\r\n--${boundary}\r\nContent-Type: ${XLSX_MIME}\r\n\r\n`,
+		fileBytes,
+		`\r\n--${boundary}--`,
+	]);
+
+	const response = await fetch(
+		'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
+		{
+			method: 'POST',
+			headers: {
+				Authorization: `Bearer ${token}`,
+				'Content-Type': `multipart/related; boundary=${boundary}`,
+			},
+			body,
+		},
+	);
+	if (!response.ok) {
+		const text = await response.text().catch(() => '');
+		throw new Error(`Drive API ${response.status}: ${text}`);
+	}
+	const json = (await response.json()) as { id: string };
+	return json.id;
+}
+
+// Resolve which spreadsheet to write to: the user's own ID if provided,
+// otherwise the remembered auto-created one, creating it from the template on
+// first use.
+async function ensureSpreadsheetId(
+	tokenRef: TokenRef,
+	userProvidedId?: string,
+): Promise<string> {
+	const provided = userProvidedId?.trim();
+	if (provided) {
+		await setStoredSpreadsheetId(provided);
+		return provided;
+	}
+
+	const stored = await getStoredSpreadsheetId();
+	if (stored) return stored;
+
+	const created = await createFromTemplate(tokenRef.token);
+	await setStoredSpreadsheetId(created);
+	return created;
+}
+
 function spreadsheetUrl(id: string): string {
 	return `https://docs.google.com/spreadsheets/d/${id}/edit`;
 }
@@ -268,21 +332,15 @@ async function handleLog(data?: SheetsRequestData): Promise<SheetsResponse> {
 	const payload = data?.payload;
 	if (!payload) return { ok: false, error: 'No replay data' };
 
-	const provided = data?.spreadsheetId?.trim();
-	const spreadsheetId = provided || (await getStoredSpreadsheetId());
-	if (!spreadsheetId) {
-		return {
-			ok: false,
-			error: 'Set your PASRS spreadsheet ID in settings first',
-		};
-	}
-	if (provided) await setStoredSpreadsheetId(provided);
-
 	const initialToken = await getAuthToken(false);
 	if (!initialToken) return { ok: false, error: 'Not signed in' };
 	const tokenRef: TokenRef = { token: initialToken };
 
 	try {
+		const spreadsheetId = await ensureSpreadsheetId(
+			tokenRef,
+			data?.spreadsheetId,
+		);
 		const count = await countDataRows(tokenRef, spreadsheetId);
 		const gameNumber = count + 1;
 		const rowNumber = GBG_FIRST_DATA_ROW + count;
