@@ -103,7 +103,7 @@ app.receive = (data: string) => {
 					copyToClipboardWithRetry(url, settings.notifications);
 				}
 
-				if (settings.log_to_sheets && settings.sheets_spreadsheet_id) {
+				if (settings.log_to_sheets) {
 					const replay = replaysManager.getReplay(roomId);
 					if (replay) {
 						sheetsRequest('log', {
