@@ -1,14 +1,13 @@
 import type {
 	SheetsAction,
-	SheetsLogPayload,
 	SheetsRequestData,
 	SheetsResponse,
 } from '../lib/events';
 
 // Background service worker: the only context that may use chrome.identity and
-// hold an OAuth token. It authenticates the user against their Google account
-// and appends recorded battles to the "GBG Data" sheet of their PASRS 4.3
-// spreadsheet via the Sheets REST API.
+// hold an OAuth token. It signs the user in and appends recorded replay URLs to
+// the HomePage of their PASRS spreadsheet, which the template's own Apps Script
+// (REPLAYTODATA / TEAMDATAFROMPASTE) turns into all the dashboards.
 //
 // Messages arrive from the content script (which relays them from the page).
 
@@ -20,20 +19,18 @@ interface BackgroundMessage {
 const SHEETS_API = 'https://sheets.googleapis.com/v4/spreadsheets';
 const TOKEN_STORAGE_KEY = 'pasrs_sheets_token';
 const SPREADSHEET_STORAGE_KEY = 'pasrs_sheets_spreadsheet_id';
-// The raw-input sheet of the PASRS 4.3 template; everything else is computed
-// from it. Data rows start at row 2 (row 1 is the header).
-const GBG_SHEET = 'GBG Data';
-const GBG_FIRST_DATA_ROW = 2;
-const GBG_COLUMN_COUNT = 32; // A..AF
+
+// PASRS HomePage layout: replay links go in C14:C113, the Showdown name in G6.
+const HOMEPAGE = 'HomePage';
+const REPLAY_RANGE = 'C14:C113';
+const REPLAY_FIRST_ROW = 14;
+const REPLAY_MAX = 100;
+const NAME_CELL = 'G6';
 
 // ---------------------------------------------------------------------------
-// Auth (launchWebAuthFlow on every browser — see notes below)
+// Auth (launchWebAuthFlow on every browser — one Web-application OAuth client)
 // ---------------------------------------------------------------------------
 
-// chrome.identity.getAuthToken is intentionally not used: it only works
-// reliably in Google Chrome and needs a different OAuth client type. One web
-// flow = one OAuth client (Web application), one code path across Chrome,
-// Chromium forks, and Firefox.
 function getOAuthConfig(): { clientId: string; scopes: string[] } {
 	const oauth2 = (
 		chrome.runtime.getManifest() as chrome.runtime.Manifest & {
@@ -71,144 +68,6 @@ async function getStoredSpreadsheetId(): Promise<string | null> {
 
 async function setStoredSpreadsheetId(id: string): Promise<void> {
 	await chrome.storage.local.set({ [SPREADSHEET_STORAGE_KEY]: id });
-}
-
-const TEMPLATE_FILE = 'pasrs-template.xlsx';
-const SPREADSHEET_TITLE = 'PASRS Helper Tracker';
-const SHEET_MIME = 'application/vnd.google-apps.spreadsheet';
-const XLSX_MIME =
-	'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-
-// Auto-create the tracker by uploading the bundled PASRS template to the user's
-// Drive, converting it to a Google Sheet. Uses Drive's multipart upload; the
-// drive.file scope is enough because the app is creating the file.
-async function createFromTemplate(token: string): Promise<string> {
-	const fileBytes = await fetchWithRetry('read bundled template', () =>
-		fetch(chrome.runtime.getURL(TEMPLATE_FILE)),
-	).then((r) => r.blob());
-
-	const boundary = `pasrs${Date.now()}`;
-	const metadata = { name: SPREADSHEET_TITLE, mimeType: SHEET_MIME };
-	const body = new Blob([
-		`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n`,
-		JSON.stringify(metadata),
-		`\r\n--${boundary}\r\nContent-Type: ${XLSX_MIME}\r\n\r\n`,
-		fileBytes,
-		`\r\n--${boundary}--`,
-	]);
-
-	const response = await fetchWithRetry('Drive upload', () =>
-		fetch(
-			'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
-			{
-				method: 'POST',
-				headers: {
-					Authorization: `Bearer ${token}`,
-					'Content-Type': `multipart/related; boundary=${boundary}`,
-				},
-				body,
-			},
-		),
-	);
-	if (!response.ok) {
-		const text = await response.text().catch(() => '');
-		throw new Error(`Drive API ${response.status}: ${text}`);
-	}
-	const json = (await response.json()) as { id: string };
-	return json.id;
-}
-
-// Whether the stored spreadsheet still exists and isn't in the trash. A trashed
-// file is still readable by ID via the Sheets API, so we check Drive explicitly
-// (drive.file can see files the app created).
-async function isLiveFile(
-	tokenRef: TokenRef,
-	spreadsheetId: string,
-): Promise<boolean> {
-	const response = await fetchWithRetry('Drive get', () =>
-		fetch(
-			`https://www.googleapis.com/drive/v3/files/${spreadsheetId}?fields=trashed`,
-			{ headers: { Authorization: `Bearer ${tokenRef.token}` } },
-		),
-	);
-	if (!response.ok) return false; // 404 / no access -> treat as gone
-	const json = (await response.json()) as { trashed?: boolean };
-	return json.trashed !== true;
-}
-
-// Whether the spreadsheet contains a "GBG Data" sheet (i.e. it's a PASRS
-// tracker). Returns false if the spreadsheet is missing/inaccessible.
-async function hasGbgSheet(
-	tokenRef: TokenRef,
-	spreadsheetId: string,
-): Promise<boolean> {
-	const response = await sheetsCall(
-		tokenRef,
-		`${spreadsheetId}?fields=sheets.properties.title`,
-		'GET',
-	);
-	if (!response.ok) {
-		if (response.status === 403 || response.status === 404) return false;
-		await expectOk(response); // surface auth/other errors
-	}
-	const json = (await response.json()) as {
-		sheets?: Array<{ properties?: { title?: string } }>;
-	};
-	return (json.sheets ?? []).some((s) => s.properties?.title === GBG_SHEET);
-}
-
-// Resolve which spreadsheet to write to: the user's own ID if provided,
-// otherwise the remembered auto-created one, creating it from the template on
-// first use. A stored ID that no longer has a GBG Data sheet (e.g. left over
-// from an older version) is discarded and recreated.
-async function ensureSpreadsheetId(
-	tokenRef: TokenRef,
-	userProvidedId?: string,
-): Promise<string> {
-	const provided = userProvidedId?.trim();
-	if (provided) {
-		if (!(await hasGbgSheet(tokenRef, provided))) {
-			throw new Error(
-				"That spreadsheet has no 'GBG Data' sheet — use a PASRS 4.3 copy, or leave the ID blank to auto-create one.",
-			);
-		}
-		await setStoredSpreadsheetId(provided);
-		return provided;
-	}
-
-	const stored = await getStoredSpreadsheetId();
-	if (
-		stored &&
-		(await isLiveFile(tokenRef, stored)) &&
-		(await hasGbgSheet(tokenRef, stored))
-	) {
-		return stored;
-	}
-
-	const created = await createFromTemplate(tokenRef.token);
-	await setStoredSpreadsheetId(created);
-	// The bundled template ships with sample games; clear them so logging starts
-	// at game 1 in a freshly created tracker.
-	await clearGbgData(tokenRef, created);
-	return created;
-}
-
-// Wipe the GBG Data input rows (keeping the header). Best-effort.
-async function clearGbgData(
-	tokenRef: TokenRef,
-	spreadsheetId: string,
-): Promise<void> {
-	try {
-		const range = encodeA1(GBG_SHEET, `A${GBG_FIRST_DATA_ROW}:AF`);
-		await sheetsCall(
-			tokenRef,
-			`${spreadsheetId}/values/${range}:clear`,
-			'POST',
-			{},
-		);
-	} catch {
-		// ignore — a stray sample row is non-fatal
-	}
 }
 
 function spreadsheetUrl(id: string): string {
@@ -270,13 +129,12 @@ async function removeCachedToken(token: string): Promise<void> {
 // Sheets API helpers
 // ---------------------------------------------------------------------------
 
-// A short-lived holder so a 401 mid-sequence can swap in a refreshed token.
 interface TokenRef {
 	token: string;
 }
 
-// fetch() that retries once on a network-level failure and, on a second
-// failure, throws a labelled error so we know which request died.
+// fetch() that retries once on a network-level failure, then throws a labelled
+// error so failures are diagnosable.
 async function fetchWithRetry(
 	label: string,
 	request: () => Promise<Response>,
@@ -331,91 +189,61 @@ async function expectOk(response: Response): Promise<void> {
 	}
 }
 
-// Encode an A1 range like  'GBG Data'!A5  (sheet name single-quoted, escaped).
 function encodeA1(sheet: string, cell: string): string {
 	return encodeURIComponent(`'${sheet.replace(/'/g, "''")}'!${cell}`);
 }
 
-// Count existing data rows by reading column B (Game number) from row 2 down.
-async function countDataRows(
+async function readValues(
 	tokenRef: TokenRef,
 	spreadsheetId: string,
-): Promise<number> {
-	const range = encodeA1(GBG_SHEET, `B${GBG_FIRST_DATA_ROW}:B`);
+	sheet: string,
+	cell: string,
+): Promise<string[][]> {
 	const response = await sheetsCall(
 		tokenRef,
-		`${spreadsheetId}/values/${range}`,
+		`${spreadsheetId}/values/${encodeA1(sheet, cell)}`,
 		'GET',
 	);
 	await expectOk(response);
 	const json = (await response.json()) as { values?: string[][] };
-	return json.values?.length ?? 0;
+	return json.values ?? [];
 }
 
-// Write a single row at the given 1-based row number.
-async function writeRowAt(
+async function writeCell(
 	tokenRef: TokenRef,
 	spreadsheetId: string,
-	rowNumber: number,
-	row: string[],
+	sheet: string,
+	cell: string,
+	value: string,
 ): Promise<void> {
-	const range = encodeA1(GBG_SHEET, `A${rowNumber}`);
 	const response = await sheetsCall(
 		tokenRef,
-		`${spreadsheetId}/values/${range}?valueInputOption=USER_ENTERED`,
+		`${spreadsheetId}/values/${encodeA1(sheet, cell)}?valueInputOption=USER_ENTERED`,
 		'PUT',
-		{ values: [row] },
+		{ values: [[value]] },
 	);
 	await expectOk(response);
 }
 
-// ---------------------------------------------------------------------------
-// GBG Data row construction
-// ---------------------------------------------------------------------------
-
-// 0-based column index for an A1 column letter (A=0 … AF=31).
-function colIndex(letter: string): number {
-	let n = 0;
-	for (const ch of letter) n = n * 26 + (ch.charCodeAt(0) - 64);
-	return n - 1;
-}
-
-function eloCell(before: string, after: string): string {
-	if (before && after) return `${before} -> ${after}`;
-	return after || before || '';
-}
-
-// Lay a battle out across the PASRS GBG Data columns (A..AF), leaving the
-// template's spacer columns blank.
-function buildGbgRow(gameNumber: number, payload: SheetsLogPayload): string[] {
-	const row = new Array<string>(GBG_COLUMN_COUNT).fill('');
-	const set = (letter: string, value: string) => {
-		row[colIndex(letter)] = value ?? '';
+// The set of tab titles present, to confirm this is a PASRS spreadsheet.
+async function getSheetTitles(
+	tokenRef: TokenRef,
+	spreadsheetId: string,
+): Promise<Set<string>> {
+	const response = await sheetsCall(
+		tokenRef,
+		`${spreadsheetId}?fields=sheets.properties.title`,
+		'GET',
+	);
+	await expectOk(response);
+	const json = (await response.json()) as {
+		sheets?: Array<{ properties?: { title?: string } }>;
 	};
-
-	set('B', String(gameNumber));
-	set('C', payload.result);
-	set('D', 'vs');
-	set('E', payload.oppName);
-
-	const oppCols = ['F', 'G', 'H', 'I', 'J', 'K'];
-	payload.oppTeam.slice(0, 6).forEach((mon, i) => set(oppCols[i], mon));
-
-	const myPickCols = ['O', 'P', 'Q', 'R']; // lead1, lead2, back1, back2
-	payload.myPicks.slice(0, 4).forEach((mon, i) => set(myPickCols[i], mon));
-
-	const oppPickCols = ['T', 'U', 'V', 'W'];
-	payload.oppPicks.slice(0, 4).forEach((mon, i) => set(oppPickCols[i], mon));
-
-	set('Z', payload.myTeraMon);
-	set('AA', payload.myTeraType);
-	set('AB', payload.oppTeraMon);
-	set('AC', payload.oppTeraType);
-	set('AD', payload.ots ? 'Yes' : '');
-	set('AE', eloCell(payload.myEloBefore, payload.myEloAfter));
-	set('AF', payload.oppElo);
-
-	return row;
+	return new Set(
+		(json.sheets ?? [])
+			.map((s) => s.properties?.title)
+			.filter((t): t is string => Boolean(t)),
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -423,27 +251,80 @@ function buildGbgRow(gameNumber: number, payload: SheetsLogPayload): string[] {
 // ---------------------------------------------------------------------------
 
 async function handleLog(data?: SheetsRequestData): Promise<SheetsResponse> {
-	const payload = data?.payload;
-	if (!payload) return { ok: false, error: 'No replay data' };
+	const url = data?.payload?.url?.trim();
+	if (!url) return { ok: false, error: 'No replay URL' };
+
+	const provided = data?.spreadsheetId?.trim();
+	const spreadsheetId = provided || (await getStoredSpreadsheetId());
+	if (!spreadsheetId) {
+		return {
+			ok: false,
+			error: 'Set your PASRS spreadsheet ID in settings first',
+		};
+	}
 
 	const initialToken = await getAuthToken(false);
 	if (!initialToken) return { ok: false, error: 'Not signed in' };
 	const tokenRef: TokenRef = { token: initialToken };
 
 	try {
-		const spreadsheetId = await ensureSpreadsheetId(
-			tokenRef,
-			data?.spreadsheetId,
-		);
-		const count = await countDataRows(tokenRef, spreadsheetId);
-		const gameNumber = count + 1;
-		const rowNumber = GBG_FIRST_DATA_ROW + count;
-		await writeRowAt(
+		const titles = await getSheetTitles(tokenRef, spreadsheetId);
+		if (!titles.has(HOMEPAGE)) {
+			return {
+				ok: false,
+				error:
+					"That spreadsheet has no 'HomePage' — make a copy of the PASRS sheet (File → Make a copy) and use its ID.",
+			};
+		}
+		if (provided) await setStoredSpreadsheetId(provided);
+
+		// Avoid duplicates and find the next free replay-link row.
+		const existing = await readValues(
 			tokenRef,
 			spreadsheetId,
-			rowNumber,
-			buildGbgRow(gameNumber, payload),
+			HOMEPAGE,
+			REPLAY_RANGE,
 		);
+		const links = existing.map((row) => (row[0] ?? '').trim());
+		if (links.includes(url)) {
+			return {
+				ok: true,
+				spreadsheetId,
+				spreadsheetUrl: spreadsheetUrl(spreadsheetId),
+			};
+		}
+		const filled = links.filter(Boolean).length;
+		if (filled >= REPLAY_MAX) {
+			return { ok: false, error: 'Replay list is full (100 links)' };
+		}
+		await writeCell(
+			tokenRef,
+			spreadsheetId,
+			HOMEPAGE,
+			`C${REPLAY_FIRST_ROW + filled}`,
+			url,
+		);
+
+		// Set the Showdown name once (so the template attributes games to you).
+		const playerName = data?.payload?.playerName?.trim();
+		if (playerName) {
+			const nameCell = await readValues(
+				tokenRef,
+				spreadsheetId,
+				HOMEPAGE,
+				NAME_CELL,
+			);
+			if (!(nameCell[0]?.[0] ?? '').trim()) {
+				await writeCell(
+					tokenRef,
+					spreadsheetId,
+					HOMEPAGE,
+					NAME_CELL,
+					playerName,
+				);
+			}
+		}
+
 		return {
 			ok: true,
 			spreadsheetId,

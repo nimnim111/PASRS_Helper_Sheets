@@ -12,18 +12,18 @@ Please follow the guidelines below to ensure a smooth contribution process.
 
 
 ## Google Sheets Integration
-PASRS Helper logs every recorded battle into the **PASRS 4.3** tracking
-spreadsheet using OAuth and the official Google Sheets API. Users sign in with
-their Google account from the settings panel; data goes directly from the
-extension to Google's API (no third party in between).
+PASRS Helper adds every recorded replay to your **PASRS 4.3** tracker using OAuth
+and the official Google Sheets API. Users sign in with their Google account from
+the settings panel; data goes directly from the extension to Google's API (no
+third party in between).
 
-It appends a row to the template's **`GBG Data`** sheet (the raw-input sheet the
-template's dashboards are computed from). Per battle it fills: Game number,
-Result, opponent name, the opponent's revealed six species, your four picks
-(leads + backs), their four picks, both sides' Tera Pokémon + type, OTS, your
-Elo (`before -> after`) and the opponent's Elo. Picks come from switch-in order,
-Tera from `|-terastallize|`, OTS from the battle rules, and Elo from rated games
-only.
+The PASRS template is driven by its own bound Apps Script functions
+(`REPLAYTODATA`, `TEAMDATAFROMPASTE`) that parse replay links and your team. So
+the extension simply **appends each replay URL to the HomePage replay-link list**
+(`HomePage!C14:C113`) and sets your Showdown name (`HomePage!G6`) if it's empty;
+the template's script then computes every dashboard. (This is why a real copy of
+the sheet is required — "File → Make a copy" keeps the script; an xlsx export
+does not.)
 
 ### How it's wired (for contributors)
 The page-injected scripts cannot use `chrome.*`, and OAuth can only run in a
@@ -37,9 +37,8 @@ page (React panel / showdown hook)
 ```
 
 - `src/lib/events.ts` — the page<->content RPC (`sheetsRequest` / `onSheetsRequest`).
-- `src/utils/showdown-battle-utils.ts` — parses players, opponent species, switches, Tera, OTS, and rating changes from the protocol.
-- `src/lib/showdown/showdown.ts` — accumulates battle details and builds the GBG Data row payload (`buildGbgPayload`).
-- `src/background/index.ts` — OAuth + Sheets API calls (`auth`, `status`, `signout`, `log`); appends to `GBG Data`.
+- `src/lib/showdown/showdown.ts` — on a recorded replay, sends the replay URL + your Showdown name.
+- `src/background/index.ts` — OAuth + Sheets API calls (`auth`, `status`, `signout`, `log`); appends the URL to HomePage.
 - `src/components/ui/SheetsSettings.tsx` — sign-in UI + spreadsheet ID.
 
 Auth uses `chrome.identity.launchWebAuthFlow` (the OAuth popup) on **every**
@@ -53,13 +52,10 @@ The extension ships with a placeholder `client_id` in `manifest.base.json`. To
 make sign-in work you must create your own OAuth client:
 
 1. In the [Google Cloud Console](https://console.cloud.google.com), create a
-   project and **enable the Google Sheets API and the Google Drive API**
-   (APIs & Services → Library).
-2. Configure the **OAuth consent screen** (External). Add the scopes
-   `https://www.googleapis.com/auth/spreadsheets` and
-   `https://www.googleapis.com/auth/drive.file` (the latter lets the extension
-   create the tracker in the user's Drive). While unverified, add yourself under
-   **Test users**.
+   project and **enable the Google Sheets API** (APIs & Services → Library).
+2. Configure the **OAuth consent screen** (External). Add the scope
+   `https://www.googleapis.com/auth/spreadsheets`. While unverified, add yourself
+   under **Test users**.
 3. Create an **OAuth client ID** of type **Web application** (the same single
    client works for all browsers).
 4. Add the extension's redirect URL(s) under **Authorized redirect URIs**. The
@@ -80,16 +76,18 @@ make sign-in work you must create your own OAuth client:
 > ~100 test users.
 
 ### User setup
-1. In the PASRS Helper side panel → **Settings → Google Sheets**, enable
-   **Log recorded replays to Google Sheets** and click **Sign in with Google**.
-2. Leave the **Spreadsheet ID** blank. On your first recorded battle the
-   extension uploads the bundled PASRS template to your Google Drive (converted
-   to a Google Sheet named "PASRS Helper Tracker") and reuses it after that. To
-   use an existing copy instead, paste its spreadsheet ID.
+1. Open the **PASRS 4.3** Google Sheet and **File → Make a copy** into your own
+   Drive (this keeps the bound Apps Script — an xlsx export does not). Fill in
+   Step 3 (your team pokepaste) once.
+2. Copy your copy's **spreadsheet ID** from the URL
+   (`https://docs.google.com/spreadsheets/d/<THIS_PART>/edit`).
+3. In the PASRS Helper side panel → **Settings → Google Sheets**, enable
+   **Log recorded replays to Google Sheets**, click **Sign in with Google**, and
+   paste the spreadsheet ID.
 
-From then on, each recorded battle appends a row to the `GBG Data` sheet and the
-tracker's dashboards update automatically. The settings panel links to your
-tracker once it exists.
+From then on, each recorded replay is added to the HomePage link list and the
+template's script updates all the dashboards. The settings panel links to your
+tracker.
 
 The template is bundled as `pasrs-template.xlsx` and uploaded via the Drive API
 (`files.create`, multipart, converting to a Google Sheet). This only needs the

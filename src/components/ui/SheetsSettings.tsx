@@ -76,7 +76,6 @@ export function SheetsSettings({
 	const [signedIn, setSignedIn] = useState(false);
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState('');
-	const [status, setStatus] = useState('');
 	const [sheetUrl, setSheetUrl] = useState('');
 
 	const refreshSheet = useCallback(() => {
@@ -116,44 +115,6 @@ export function SheetsSettings({
 		setSignedIn(false);
 	};
 
-	const handleTestRow = async (): Promise<void> => {
-		setBusy(true);
-		setError('');
-		setStatus('');
-		const res = await sheetsRequest('log', {
-			spreadsheetId,
-			payload: {
-				result: 'Win',
-				oppName: 'TestOpponent',
-				oppTeam: [
-					'Koraidon',
-					'Flutter Mane',
-					'Urshifu-Rapid-Strike',
-					'Rillaboom',
-					'Incineroar',
-					'Amoonguss',
-				],
-				myPicks: ['Calyrex-Shadow', 'Miraidon', 'Urshifu', 'Whimsicott'],
-				oppPicks: ['Koraidon', 'Flutter Mane', 'Rillaboom', 'Incineroar'],
-				myTeraMon: 'Calyrex-Shadow',
-				myTeraType: 'Ghost',
-				oppTeraMon: 'Flutter Mane',
-				oppTeraType: 'Fairy',
-				ots: true,
-				myEloBefore: '1500',
-				myEloAfter: '1516',
-				oppElo: '1490',
-			},
-		});
-		setBusy(false);
-		if (res.ok) {
-			setStatus('Test row added.');
-			if (res.spreadsheetUrl) setSheetUrl(res.spreadsheetUrl);
-		} else {
-			setError(res.error || 'Failed to add test row');
-		}
-	};
-
 	return (
 		<>
 			<SettingsCheckbox
@@ -180,21 +141,12 @@ export function SheetsSettings({
 				<StatusText $signedIn={signedIn}>
 					{signedIn ? 'Signed in' : 'Not signed in'}
 				</StatusText>
-				{signedIn && (
-					<AuthButton
-						type="button"
-						onClick={handleTestRow}
-						disabled={busy || !logToSheets}
-					>
-						Send test row
-					</AuthButton>
-				)}
 			</AuthRow>
 
 			<SettingsTextInput
 				settingsKey="sheets_spreadsheet_id"
 				value={spreadsheetId}
-				placeholder="Spreadsheet ID (leave blank to auto-create)"
+				placeholder="PASRS spreadsheet ID"
 				onChange={onTextChange}
 				disabled={!logToSheets}
 			/>
@@ -202,18 +154,17 @@ export function SheetsSettings({
 			<HintText>
 				{sheetUrl ? (
 					<>
-						Logging to your{' '}
+						Adding replays to your{' '}
 						<a href={sheetUrl} target="_blank" rel="noopener noreferrer">
 							PASRS tracker
 						</a>
 						.
 					</>
 				) : (
-					'Leave blank and a PASRS tracker will be created in your Google Drive on your first battle. Or paste an existing copy’s ID.'
+					'Make a copy of the PASRS sheet (File → Make a copy) and paste its spreadsheet ID from the URL.'
 				)}
 			</HintText>
 
-			{status && <HintText>{status}</HintText>}
 			{error && <ErrorText>{error}</ErrorText>}
 
 			<GuideLink

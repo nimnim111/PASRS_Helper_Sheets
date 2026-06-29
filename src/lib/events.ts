@@ -18,21 +18,11 @@ export type SheetsAction =
 	| 'log'
 	| 'spreadsheet';
 
-// Fields for one row of the PASRS 4.3 "GBG Data" sheet.
+// The replay to add to the PASRS HomePage. The template's Apps Script parses
+// everything else from the replay itself.
 export interface SheetsLogPayload {
-	result: string; // 'Win' | 'Loss' | 'Draw'
-	oppName: string;
-	oppTeam: string[]; // opponent's revealed 6 species (F–K)
-	myPicks: string[]; // your brought 4: lead1, lead2, back1, back2 (O–R)
-	oppPicks: string[]; // opp brought 4: lead1, lead2, back1, back2 (T–W)
-	myTeraMon: string;
-	myTeraType: string;
-	oppTeraMon: string;
-	oppTeraType: string;
-	ots: boolean;
-	myEloBefore: string;
-	myEloAfter: string;
-	oppElo: string;
+	url: string;
+	playerName: string; // Showdown username, set in HomePage Step 2 if empty
 }
 
 export interface SheetsRequestData {
