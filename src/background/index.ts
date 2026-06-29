@@ -83,9 +83,9 @@ const XLSX_MIME =
 // Drive, converting it to a Google Sheet. Uses Drive's multipart upload; the
 // drive.file scope is enough because the app is creating the file.
 async function createFromTemplate(token: string): Promise<string> {
-	const fileBytes = await (
-		await fetch(chrome.runtime.getURL(TEMPLATE_FILE))
-	).blob();
+	const fileBytes = await fetchWithRetry('read bundled template', () =>
+		fetch(chrome.runtime.getURL(TEMPLATE_FILE)),
+	).then((r) => r.blob());
 
 	const boundary = `pasrs${Date.now()}`;
 	const metadata = { name: SPREADSHEET_TITLE, mimeType: SHEET_MIME };
@@ -97,16 +97,18 @@ async function createFromTemplate(token: string): Promise<string> {
 		`\r\n--${boundary}--`,
 	]);
 
-	const response = await fetch(
-		'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
-		{
-			method: 'POST',
-			headers: {
-				Authorization: `Bearer ${token}`,
-				'Content-Type': `multipart/related; boundary=${boundary}`,
+	const response = await fetchWithRetry('Drive upload', () =>
+		fetch(
+			'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
+			{
+				method: 'POST',
+				headers: {
+					Authorization: `Bearer ${token}`,
+					'Content-Type': `multipart/related; boundary=${boundary}`,
+				},
+				body,
 			},
-			body,
-		},
+		),
 	);
 	if (!response.ok) {
 		const text = await response.text().catch(() => '');
@@ -249,6 +251,23 @@ interface TokenRef {
 	token: string;
 }
 
+// fetch() that retries once on a network-level failure and, on a second
+// failure, throws a labelled error so we know which request died.
+async function fetchWithRetry(
+	label: string,
+	request: () => Promise<Response>,
+): Promise<Response> {
+	try {
+		return await request();
+	} catch {
+		try {
+			return await request();
+		} catch (error) {
+			throw new Error(`Network error (${label}): ${error}`);
+		}
+	}
+}
+
 // Low-level Sheets API call with one automatic token refresh on 401.
 async function sheetsCall(
 	tokenRef: TokenRef,
@@ -256,15 +275,18 @@ async function sheetsCall(
 	method: string,
 	body?: unknown,
 ): Promise<Response> {
+	const label = `Sheets ${method} ${path.split('/').pop()?.split('?')[0]}`;
 	const doFetch = (token: string) =>
-		fetch(`${SHEETS_API}/${path}`, {
-			method,
-			headers: {
-				Authorization: `Bearer ${token}`,
-				'Content-Type': 'application/json',
-			},
-			body: body === undefined ? undefined : JSON.stringify(body),
-		});
+		fetchWithRetry(label, () =>
+			fetch(`${SHEETS_API}/${path}`, {
+				method,
+				headers: {
+					Authorization: `Bearer ${token}`,
+					'Content-Type': 'application/json',
+				},
+				body: body === undefined ? undefined : JSON.stringify(body),
+			}),
+		);
 
 	let response = await doFetch(tokenRef.token);
 	if (response.status === 401) {
