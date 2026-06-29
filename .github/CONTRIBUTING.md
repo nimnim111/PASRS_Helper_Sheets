@@ -27,12 +27,18 @@ background context, so requests hop through three contexts:
 page (React panel / showdown hook)
   --window.postMessage-->  content script (src/extension/index.ts)
   --chrome.runtime.sendMessage-->  background worker (src/background/index.ts)
-  --> chrome.identity.getAuthToken --> Sheets API
+  --> chrome.identity.launchWebAuthFlow --> Sheets API
 ```
 
 - `src/lib/events.ts` — the page<->content RPC (`sheetsRequest` / `onSheetsRequest`).
 - `src/background/index.ts` — OAuth + Sheets API calls (`auth`, `status`, `signout`, `log`).
 - `src/components/ui/SheetsSettings.tsx` — sign-in UI + spreadsheet ID / sheet name.
+
+Auth uses `chrome.identity.launchWebAuthFlow` (the OAuth popup) on **every**
+browser — Chrome, Chromium forks (Brave, Edge, …) and Firefox. We deliberately
+do **not** use `chrome.identity.getAuthToken`: it only works reliably in Google
+Chrome and needs a different client type. One web flow means one OAuth client
+and one code path.
 
 ### Developer setup: Google Cloud OAuth client (required)
 The extension ships with a placeholder `client_id` in `manifest.base.json`. To
@@ -41,33 +47,26 @@ make sign-in work you must create your own OAuth client:
 1. In the [Google Cloud Console](https://console.cloud.google.com), create a
    project and **enable the Google Sheets API** (APIs & Services → Library).
 2. Configure the **OAuth consent screen** (External). Add the scope
-   `https://www.googleapis.com/auth/spreadsheets`. While unverified you can add
-   yourself as a test user.
-3. Create an **OAuth client ID** of type **Chrome Extension**, using your
-   unpacked extension's ID (from `chrome://extensions`). Note: the published
-   Web Store ID differs from your local dev ID, so you'll typically need a
-   separate client for production.
-4. Replace `client_id` in `manifest.base.json` with the generated value and
-   rebuild.
+   `https://www.googleapis.com/auth/spreadsheets`. While unverified, add yourself
+   under **Test users**.
+3. Create an **OAuth client ID** of type **Web application** (the same single
+   client works for all browsers).
+4. Add the extension's redirect URL(s) under **Authorized redirect URIs**. The
+   value comes from `chrome.identity.getRedirectURL()` and differs per browser —
+   load the unpacked build and read it from the background console:
+   - Chromium: `https://<extension-id>.chromiumapp.org/`
+   - Firefox: `https://<id>.extensions.allizom.org/` (stable because the build
+     pins `browser_specific_settings.gecko.id`)
+
+   Add one entry per browser you'll run.
+5. Replace `client_id` in `manifest.base.json` with the generated value, then
+   `npm run build:chrome` (or `build:firefox`). The Firefox build automatically
+   converts the background to the `scripts` form Firefox MV3 expects.
 
 > Public distribution requires Google **app verification** for the sensitive
 > Sheets scope (privacy policy, demo video, possibly a security assessment).
 > Until verified, users see an "unverified app" warning and you're capped at
 > ~100 test users.
->
-#### Firefox
-`chrome.identity.getAuthToken` is Chrome-only. On Firefox the background detects
-this at runtime and uses `launchWebAuthFlow` (OAuth implicit flow) instead, so
-you need a second OAuth client of type **Web application**:
-
-1. Create a **Web application** OAuth client in the same Cloud project.
-2. Add the extension's redirect URL — `chrome.identity.getRedirectURL()`, which
-   on Firefox looks like `https://<id>.extensions.allizom.org/` — as an
-   **Authorized redirect URI**. The `<id>` is stable because the build pins a
-   `browser_specific_settings.gecko.id`.
-3. Use that client's ID for Firefox builds (`oauth2.client_id` in
-   `manifest.base.json`). The `build:firefox` target automatically converts the
-   background to the `scripts` form Firefox MV3 expects.
 
 ### User setup
 1. Open the target Google Sheet and copy its **spreadsheet ID** from the URL
