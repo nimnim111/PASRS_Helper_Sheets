@@ -116,21 +116,48 @@ async function createFromTemplate(token: string): Promise<string> {
 	return json.id;
 }
 
+// Whether the spreadsheet contains a "GBG Data" sheet (i.e. it's a PASRS
+// tracker). Returns false if the spreadsheet is missing/inaccessible.
+async function hasGbgSheet(
+	tokenRef: TokenRef,
+	spreadsheetId: string,
+): Promise<boolean> {
+	const response = await sheetsCall(
+		tokenRef,
+		`${spreadsheetId}?fields=sheets.properties.title`,
+		'GET',
+	);
+	if (!response.ok) {
+		if (response.status === 403 || response.status === 404) return false;
+		await expectOk(response); // surface auth/other errors
+	}
+	const json = (await response.json()) as {
+		sheets?: Array<{ properties?: { title?: string } }>;
+	};
+	return (json.sheets ?? []).some((s) => s.properties?.title === GBG_SHEET);
+}
+
 // Resolve which spreadsheet to write to: the user's own ID if provided,
 // otherwise the remembered auto-created one, creating it from the template on
-// first use.
+// first use. A stored ID that no longer has a GBG Data sheet (e.g. left over
+// from an older version) is discarded and recreated.
 async function ensureSpreadsheetId(
 	tokenRef: TokenRef,
 	userProvidedId?: string,
 ): Promise<string> {
 	const provided = userProvidedId?.trim();
 	if (provided) {
+		if (!(await hasGbgSheet(tokenRef, provided))) {
+			throw new Error(
+				"That spreadsheet has no 'GBG Data' sheet — use a PASRS 4.3 copy, or leave the ID blank to auto-create one.",
+			);
+		}
 		await setStoredSpreadsheetId(provided);
 		return provided;
 	}
 
 	const stored = await getStoredSpreadsheetId();
-	if (stored) return stored;
+	if (stored && (await hasGbgSheet(tokenRef, stored))) return stored;
 
 	const created = await createFromTemplate(tokenRef.token);
 	await setStoredSpreadsheetId(created);
