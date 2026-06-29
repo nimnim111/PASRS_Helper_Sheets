@@ -69,15 +69,15 @@ make sign-in work you must create your own OAuth client:
 > ~100 test users.
 
 ### User setup
-1. Open the target Google Sheet and copy its **spreadsheet ID** from the URL
-   (`https://docs.google.com/spreadsheets/d/<THIS_PART>/edit`).
-2. In the PASRS Helper side panel → **Settings → Google Sheets**, enable
+1. In the PASRS Helper side panel → **Settings → Google Sheets**, enable
    **Log recorded replays to Google Sheets**.
-3. Click **Sign in with Google** and grant access.
-4. Paste the spreadsheet ID and, if your tab isn't named `Sheet1`, the sheet
-   (tab) name.
+2. Click **Sign in with Google** and grant access.
+3. Leave the **Spreadsheet ID** blank to have the extension create (and reuse) a
+   "PASRS Helper Replays" sheet automatically, or paste an existing spreadsheet
+   ID to log into your own. Set the **tab name** only if it isn't `Sheet1`.
 
-From then on, each recorded replay appends a row to your sheet.
+From then on, each recorded replay appends a row to your sheet. The settings
+panel shows a link to whichever sheet is being used.
 
 ## Maintainers / Credits
 The project is maintained by the following individuals:<br>

@@ -11,7 +11,12 @@ import type { Settings } from '../types/settings';
 export const SHEETS_REQUEST = 'pasrs:sheets-request' as const;
 export const SHEETS_RESPONSE = 'pasrs:sheets-response' as const;
 
-export type SheetsAction = 'auth' | 'signout' | 'status' | 'log';
+export type SheetsAction =
+	| 'auth'
+	| 'signout'
+	| 'status'
+	| 'log'
+	| 'spreadsheet';
 
 export interface SheetsLogPayload {
 	format: string;
@@ -38,6 +43,9 @@ export interface SheetsResponse {
 	ok: boolean;
 	error?: string;
 	signedIn?: boolean;
+	// The spreadsheet actually used/created (so the UI can link to it).
+	spreadsheetId?: string;
+	spreadsheetUrl?: string;
 }
 
 export interface SheetsResponseMessage extends SheetsResponse {

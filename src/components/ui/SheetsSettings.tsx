@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import styled from 'styled-components';
 import { sheetsRequest } from '../../lib/events';
 import type { SettingsKey } from '../../types/settings';
@@ -46,6 +46,12 @@ const ErrorText = styled.span`
 	color: #c0392b;
 `;
 
+const HintText = styled.span`
+	padding: 4px 13px 0;
+	font-size: 0.8em;
+	opacity: 0.85;
+`;
+
 const GuideLink = styled.a`
 	padding: 4px 13px 0;
 	font-size: 0.8em;
@@ -72,12 +78,23 @@ export function SheetsSettings({
 	const [signedIn, setSignedIn] = useState(false);
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState('');
+	const [sheetUrl, setSheetUrl] = useState('');
+
+	const refreshSheet = useCallback(() => {
+		sheetsRequest('spreadsheet', { spreadsheetId }).then((res) => {
+			if (res.ok) setSheetUrl(res.spreadsheetUrl ?? '');
+		});
+	}, [spreadsheetId]);
 
 	useEffect(() => {
 		sheetsRequest('status').then((res) => {
 			if (res.ok) setSignedIn(!!res.signedIn);
 		});
 	}, []);
+
+	useEffect(() => {
+		refreshSheet();
+	}, [refreshSheet]);
 
 	const handleSignIn = async (): Promise<void> => {
 		setBusy(true);
@@ -86,6 +103,7 @@ export function SheetsSettings({
 		setBusy(false);
 		if (res.ok) {
 			setSignedIn(true);
+			refreshSheet();
 		} else {
 			setError(res.error || 'Sign-in failed');
 		}
@@ -130,7 +148,7 @@ export function SheetsSettings({
 			<SettingsTextInput
 				settingsKey="sheets_spreadsheet_id"
 				value={spreadsheetId}
-				placeholder="Spreadsheet ID"
+				placeholder="Spreadsheet ID (leave blank to auto-create)"
 				onChange={onTextChange}
 				disabled={!logToSheets}
 			/>
@@ -141,6 +159,20 @@ export function SheetsSettings({
 				onChange={onTextChange}
 				disabled={!logToSheets}
 			/>
+
+			<HintText>
+				{sheetUrl ? (
+					<>
+						Logging to{' '}
+						<a href={sheetUrl} target="_blank" rel="noopener noreferrer">
+							your spreadsheet
+						</a>
+						.
+					</>
+				) : (
+					'Leave the ID blank and a spreadsheet will be created automatically on your first replay.'
+				)}
+			</HintText>
 
 			{error && <ErrorText>{error}</ErrorText>}
 

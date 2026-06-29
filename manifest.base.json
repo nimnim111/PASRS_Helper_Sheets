@@ -13,7 +13,7 @@
 		"https://sheets.googleapis.com/*"
 	],
 	"oauth2": {
-		"client_id": "REPLACE_WITH_YOUR_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com",
+		"client_id": "399755851205-l7i2g4jrqbgv9a8lsrqe8drbo1lqdg19.apps.googleusercontent.com",
 		"scopes": ["https://www.googleapis.com/auth/spreadsheets"]
 	},
 	"background": {
