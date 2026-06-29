@@ -161,7 +161,28 @@ async function ensureSpreadsheetId(
 
 	const created = await createFromTemplate(tokenRef.token);
 	await setStoredSpreadsheetId(created);
+	// The bundled template ships with sample games; clear them so logging starts
+	// at game 1 in a freshly created tracker.
+	await clearGbgData(tokenRef, created);
 	return created;
+}
+
+// Wipe the GBG Data input rows (keeping the header). Best-effort.
+async function clearGbgData(
+	tokenRef: TokenRef,
+	spreadsheetId: string,
+): Promise<void> {
+	try {
+		const range = encodeA1(GBG_SHEET, `A${GBG_FIRST_DATA_ROW}:AF`);
+		await sheetsCall(
+			tokenRef,
+			`${spreadsheetId}/values/${range}:clear`,
+			'POST',
+			{},
+		);
+	} catch {
+		// ignore — a stray sample row is non-fatal
+	}
 }
 
 function spreadsheetUrl(id: string): string {
