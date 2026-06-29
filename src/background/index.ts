@@ -63,6 +63,7 @@ const BATTLE_COLUMNS = [
 	'Elo Change',
 	'Opp Elo',
 	'Opp Team',
+	'Opp Pokepaste',
 	'Replay URL',
 ];
 
@@ -121,8 +122,8 @@ const WIN_FG: Color = { red: 0.0, green: 0.38, blue: 0.0 };
 const LOSS_BG: Color = { red: 0.99, green: 0.8, blue: 0.8 };
 const LOSS_FG: Color = { red: 0.6, green: 0.0, blue: 0.0 };
 
-// Pixel widths for the 10 battle columns (A–J).
-const COLUMN_WIDTHS = [170, 150, 120, 150, 70, 80, 95, 80, 230, 260];
+// Pixel widths for the battle columns (A–K).
+const COLUMN_WIDTHS = [170, 150, 120, 150, 70, 80, 95, 80, 230, 180, 260];
 const MON_ROW_HEIGHT = 72;
 const SPRITE_PX = 64;
 
@@ -523,7 +524,35 @@ function describeTeamChanges(prev: TeamMon[], next: TeamMon[]): string {
 	return changes.join('; ');
 }
 
-function buildBattleRow(payload: SheetsLogPayload): string[] {
+// Create a PokePaste of the opponent's revealed species (species-only, since
+// their items/moves aren't known). Returns the paste URL, or '' on failure.
+async function createPokepaste(
+	species: string[],
+	title: string,
+): Promise<string> {
+	if (species.length === 0) return '';
+	const body = new URLSearchParams({
+		paste: species.join('\n\n'),
+		title,
+		author: 'PASRS Helper',
+	});
+	try {
+		// 303 redirect is followed automatically; response.url is the paste URL.
+		const response = await fetch('https://pokepast.es/create', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: body.toString(),
+		});
+		return response.ok ? response.url : '';
+	} catch {
+		return '';
+	}
+}
+
+function buildBattleRow(
+	payload: SheetsLogPayload,
+	oppPokepaste: string,
+): string[] {
 	const you = payload.mySide === 'p2' ? payload.p2 : payload.p1;
 	const opponent = payload.mySide === 'p2' ? payload.p1 : payload.p2;
 	return [
@@ -536,6 +565,7 @@ function buildBattleRow(payload: SheetsLogPayload): string[] {
 		payload.myEloDelta ?? '',
 		payload.oppElo ?? '',
 		(payload.oppTeamSpecies ?? []).join(', '),
+		oppPokepaste,
 		payload.url,
 	];
 }
@@ -581,8 +611,14 @@ async function handleLog(data?: SheetsRequestData): Promise<SheetsResponse> {
 		allMeta[spreadsheetId] = meta;
 		await setAllMeta(allMeta);
 
+		const opponent = payload.mySide === 'p2' ? payload.p1 : payload.p2;
+		const oppPokepaste = await createPokepaste(
+			payload.oppTeamSpecies ?? [],
+			`${opponent} — ${payload.format}`,
+		);
+
 		await appendRows(tokenRef, spreadsheetId, teamMeta.tabName, [
-			buildBattleRow(payload),
+			buildBattleRow(payload, oppPokepaste),
 		]);
 
 		return {

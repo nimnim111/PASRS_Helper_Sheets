@@ -20,7 +20,10 @@ settings panel; replay data goes directly from the extension to Google's API
 Replays are segmented by the team you played: each unique set of six species
 gets its own tab ("Team 1", "Team 2", …) with the team (species, item, moves)
 at the top, followed by a battle table. Columns: `Timestamp, Format, You,
-Opponent, Result, Your Elo, Elo Change, Opp Elo, Opp Team, Replay URL`. Keeping
+Opponent, Result, Your Elo, Elo Change, Opp Elo, Opp Team, Opp Pokepaste,
+Replay URL`. The Opp Pokepaste links to an auto-created
+[pokepast.es](https://pokepast.es) paste of the opponent's revealed species
+(species only — their items/moves aren't known). Keeping
 the same species but changing items/moves inserts a "Team updated" marker row in
 the same tab; changing a species starts a new tab. Elo columns are populated for
 rated games only.

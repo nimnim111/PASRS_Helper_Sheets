@@ -10,7 +10,8 @@
 	"host_permissions": [
 		"*://*.pokemonshowdown.com/*",
 		"*://*.psim.us/*",
-		"https://sheets.googleapis.com/*"
+		"https://sheets.googleapis.com/*",
+		"https://pokepast.es/*"
 	],
 	"oauth2": {
 		"client_id": "399755851205-l7i2g4jrqbgv9a8lsrqe8drbo1lqdg19.apps.googleusercontent.com",
