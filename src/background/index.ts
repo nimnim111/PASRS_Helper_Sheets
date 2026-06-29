@@ -17,9 +17,92 @@ interface BackgroundMessage {
 
 const SHEETS_API = 'https://sheets.googleapis.com/v4/spreadsheets';
 
-// Acquire an OAuth token. interactive=true shows the Google account picker /
-// consent screen; interactive=false silently returns a cached token or none.
-function getAuthToken(interactive: boolean): Promise<string | null> {
+// chrome.identity.getAuthToken only exists in Chromium. On Firefox we fall back
+// to the standard launchWebAuthFlow OAuth dance.
+const hasGetAuthToken = typeof chrome.identity?.getAuthToken === 'function';
+
+function getOAuthConfig(): { clientId: string; scopes: string[] } {
+	// On Chrome these come from the manifest's oauth2 block. On Firefox that key
+	// is ignored by getAuthToken (which doesn't exist), so the launchWebAuthFlow
+	// path reads the same values — register a *Web application* client whose ID
+	// is set here / in the manifest and add chrome.identity.getRedirectURL() as
+	// an authorized redirect URI.
+	const oauth2 = (
+		chrome.runtime.getManifest() as chrome.runtime.Manifest & {
+			oauth2?: { client_id: string; scopes: string[] };
+		}
+	).oauth2;
+	return {
+		clientId: oauth2?.client_id ?? '',
+		scopes: oauth2?.scopes ?? ['https://www.googleapis.com/auth/spreadsheets'],
+	};
+}
+
+interface StoredToken {
+	token: string;
+	expiresAt: number;
+}
+
+const TOKEN_STORAGE_KEY = 'pasrs_sheets_token';
+
+async function getStoredToken(): Promise<StoredToken | null> {
+	const stored = await chrome.storage.local.get(TOKEN_STORAGE_KEY);
+	return (stored[TOKEN_STORAGE_KEY] as StoredToken | undefined) ?? null;
+}
+
+async function setStoredToken(token: StoredToken | null): Promise<void> {
+	if (token) {
+		await chrome.storage.local.set({ [TOKEN_STORAGE_KEY]: token });
+	} else {
+		await chrome.storage.local.remove(TOKEN_STORAGE_KEY);
+	}
+}
+
+// Firefox path: OAuth implicit flow via launchWebAuthFlow. Tokens are cached in
+// storage (the service worker / event page can be torn down between calls).
+async function getTokenViaWebAuthFlow(
+	interactive: boolean,
+): Promise<string | null> {
+	const cached = await getStoredToken();
+	if (cached && cached.expiresAt > Date.now() + 60000) {
+		return cached.token;
+	}
+
+	const { clientId, scopes } = getOAuthConfig();
+	const redirectUri = chrome.identity.getRedirectURL();
+	const authUrl =
+		'https://accounts.google.com/o/oauth2/v2/auth?' +
+		new URLSearchParams({
+			client_id: clientId,
+			response_type: 'token',
+			redirect_uri: redirectUri,
+			scope: scopes.join(' '),
+			prompt: interactive ? 'consent' : 'none',
+		}).toString();
+
+	let responseUrl: string | undefined;
+	try {
+		responseUrl = await chrome.identity.launchWebAuthFlow({
+			url: authUrl,
+			interactive,
+		});
+	} catch {
+		return null;
+	}
+	if (!responseUrl) return null;
+
+	const fragment = responseUrl.split('#')[1] ?? '';
+	const params = new URLSearchParams(fragment);
+	const token = params.get('access_token');
+	if (!token) return null;
+
+	const expiresIn = Number(params.get('expires_in') ?? '3600');
+	await setStoredToken({ token, expiresAt: Date.now() + expiresIn * 1000 });
+	return token;
+}
+
+// Chrome path: getAuthToken handles caching, the account picker and consent.
+function getTokenViaIdentity(interactive: boolean): Promise<string | null> {
 	return new Promise((resolve) => {
 		chrome.identity.getAuthToken({ interactive }, (token) => {
 			if (chrome.runtime.lastError || !token) {
@@ -31,12 +114,24 @@ function getAuthToken(interactive: boolean): Promise<string | null> {
 	});
 }
 
-// Drop a token both from Chrome's cache and Google's side so the next sign-in
-// is clean. Used on sign-out and after a 401 (stale/revoked token).
+// Acquire an OAuth token. interactive=true shows the Google account picker /
+// consent screen; interactive=false silently returns a cached token or none.
+function getAuthToken(interactive: boolean): Promise<string | null> {
+	return hasGetAuthToken
+		? getTokenViaIdentity(interactive)
+		: getTokenViaWebAuthFlow(interactive);
+}
+
+// Drop a token so the next sign-in is clean. Used on sign-out and after a 401
+// (stale/revoked token).
 async function removeCachedToken(token: string): Promise<void> {
-	await new Promise<void>((resolve) => {
-		chrome.identity.removeCachedAuthToken({ token }, () => resolve());
-	});
+	if (hasGetAuthToken) {
+		await new Promise<void>((resolve) => {
+			chrome.identity.removeCachedAuthToken({ token }, () => resolve());
+		});
+	} else {
+		await setStoredToken(null);
+	}
 	try {
 		await fetch(`https://accounts.google.com/o/oauth2/revoke?token=${token}`);
 	} catch {

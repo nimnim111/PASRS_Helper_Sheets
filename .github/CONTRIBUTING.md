@@ -55,8 +55,19 @@ make sign-in work you must create your own OAuth client:
 > Until verified, users see an "unverified app" warning and you're capped at
 > ~100 test users.
 >
-> `chrome.identity.getAuthToken` is Chrome-only — Firefox would need a separate
-> `launchWebAuthFlow` implementation.
+#### Firefox
+`chrome.identity.getAuthToken` is Chrome-only. On Firefox the background detects
+this at runtime and uses `launchWebAuthFlow` (OAuth implicit flow) instead, so
+you need a second OAuth client of type **Web application**:
+
+1. Create a **Web application** OAuth client in the same Cloud project.
+2. Add the extension's redirect URL — `chrome.identity.getRedirectURL()`, which
+   on Firefox looks like `https://<id>.extensions.allizom.org/` — as an
+   **Authorized redirect URI**. The `<id>` is stable because the build pins a
+   `browser_specific_settings.gecko.id`.
+3. Use that client's ID for Firefox builds (`oauth2.client_id` in
+   `manifest.base.json`). The `build:firefox` target automatically converts the
+   background to the `scripts` form Firefox MV3 expects.
 
 ### User setup
 1. Open the target Google Sheet and copy its **spreadsheet ID** from the URL

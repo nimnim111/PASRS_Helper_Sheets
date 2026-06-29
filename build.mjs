@@ -147,6 +147,12 @@ function build(target = 'chrome') {
 
 	if (target === 'firefox') {
 		manifest.browser_specific_settings = JSON.parse(`{${FIREFOX_ID}}`);
+		// Firefox MV3 uses an event-page style background; service_worker is not
+		// reliably supported. The Sheets auth there goes through launchWebAuthFlow.
+		const serviceWorker = manifest.background?.service_worker;
+		if (serviceWorker) {
+			manifest.background = { scripts: [serviceWorker] };
+		}
 	} else {
 		manifest.browser_specific_settings = undefined;
 	}
