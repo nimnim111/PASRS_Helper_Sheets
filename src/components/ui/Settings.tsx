@@ -1,9 +1,10 @@
 import styled from 'styled-components';
 import { useSettings } from '../../hooks/useSettings';
 import type { SettingsKey } from '../../types/settings';
-import { PanelRoot, PanelDivider, PanelTitle } from './Panel';
+import { PanelDivider, PanelRoot, PanelTitle } from './Panel';
 import { SettingsCheckbox } from './SettingsCheckBox';
 import { SettingsFormatSelect } from './SettingsFormatSelect';
+import { SheetsSettings } from './SheetsSettings';
 
 // @ts-ignore : VERSION is injected by the bundler
 const VERSION_TEXT = VERSION;
@@ -85,6 +86,10 @@ export function Settings() {
 		updateSetting(key, value);
 	};
 
+	const handleTextChange = (key: SettingsKey, value: string): void => {
+		updateSetting(key, value);
+	};
+
 	return (
 		<SettingsRoot>
 			<PanelTitle>Settings</PanelTitle>
@@ -125,6 +130,19 @@ export function Settings() {
 					customFormats={customFormats}
 					onChange={handleFormatSelectChange}
 					disabled={!settings.use_custom_replay_filter}
+				/>
+			</SettingsGroup>
+
+			<PanelDivider />
+
+			<SettingsGroup>
+				<GroupLabel>Google Sheets</GroupLabel>
+				<SheetsSettings
+					logToSheets={settings.log_to_sheets}
+					spreadsheetId={settings.sheets_spreadsheet_id}
+					sheetName={settings.sheets_sheet_name}
+					onCheckboxChange={handleCheckboxChange}
+					onTextChange={handleTextChange}
 				/>
 			</SettingsGroup>
 

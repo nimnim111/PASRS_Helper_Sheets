@@ -1,6 +1,129 @@
 import type { RoomReplay } from '../types/replay';
 import type { Settings } from '../types/settings';
 
+// Cross-context RPC (page <-> content script) for Google Sheets logging.
+//
+// The page-injected scripts (React panel, showdown hook) cannot use chrome.*,
+// and OAuth + the Sheets API can only run in the background service worker.
+// So requests hop: page --window.postMessage--> content script
+// --chrome.runtime.sendMessage--> background, and the response travels back the
+// same way. Each request carries a unique id so concurrent calls don't cross.
+export const SHEETS_REQUEST = 'pasrs:sheets-request' as const;
+export const SHEETS_RESPONSE = 'pasrs:sheets-response' as const;
+
+export type SheetsAction = 'auth' | 'signout' | 'status' | 'log';
+
+export interface SheetsLogPayload {
+	format: string;
+	p1: string;
+	p2: string;
+	result: string;
+	url: string;
+}
+
+export interface SheetsRequestData {
+	spreadsheetId?: string;
+	sheetName?: string;
+	payload?: SheetsLogPayload;
+}
+
+export interface SheetsRequestMessage {
+	type: typeof SHEETS_REQUEST;
+	requestId: string;
+	action: SheetsAction;
+	data?: SheetsRequestData;
+}
+
+export interface SheetsResponse {
+	ok: boolean;
+	error?: string;
+	signedIn?: boolean;
+}
+
+export interface SheetsResponseMessage extends SheetsResponse {
+	type: typeof SHEETS_RESPONSE;
+	requestId: string;
+}
+
+let sheetsRequestCounter = 0;
+
+// Page-side: send a request to the background worker and await its response.
+export const sheetsRequest = (
+	action: SheetsAction,
+	data?: SheetsRequestData,
+	timeoutMs = 60000,
+): Promise<SheetsResponse> => {
+	const requestId = `${Date.now()}-${sheetsRequestCounter++}`;
+
+	return new Promise((resolve) => {
+		const cleanup = () => {
+			window.removeEventListener('message', handler);
+			clearTimeout(timer);
+		};
+
+		const handler = (event: MessageEvent) => {
+			if (event.source !== window) return;
+			const data = event.data as SheetsResponseMessage | undefined;
+			if (
+				!data ||
+				data.type !== SHEETS_RESPONSE ||
+				data.requestId !== requestId
+			) {
+				return;
+			}
+			cleanup();
+			resolve({ ok: data.ok, error: data.error, signedIn: data.signedIn });
+		};
+
+		const timer = setTimeout(() => {
+			cleanup();
+			resolve({ ok: false, error: 'Request timed out' });
+		}, timeoutMs);
+
+		window.addEventListener('message', handler);
+
+		const message: SheetsRequestMessage = {
+			type: SHEETS_REQUEST,
+			requestId,
+			action,
+			data,
+		};
+		window.postMessage(message, window.location.origin);
+	});
+};
+
+// Content-script side: handle requests coming from the page and post results
+// back. The handler typically forwards to the background service worker.
+export const onSheetsRequest = (
+	handler: (message: SheetsRequestMessage) => Promise<SheetsResponse>,
+) => {
+	const listener = (event: MessageEvent) => {
+		if (event.source !== window) return;
+		const data = event.data as SheetsRequestMessage | undefined;
+		if (!data || data.type !== SHEETS_REQUEST) return;
+
+		handler(data)
+			.then((response) => sendSheetsResponse(data.requestId, response))
+			.catch((error) =>
+				sendSheetsResponse(data.requestId, {
+					ok: false,
+					error: String(error),
+				}),
+			);
+	};
+	window.addEventListener('message', listener);
+	return () => window.removeEventListener('message', listener);
+};
+
+const sendSheetsResponse = (requestId: string, response: SheetsResponse) => {
+	const message: SheetsResponseMessage = {
+		type: SHEETS_RESPONSE,
+		requestId,
+		...response,
+	};
+	window.postMessage(message, window.location.origin);
+};
+
 export const EVENTS = {
 	FORMATS_UPDATED: 'pasrs:formats-updated',
 	SETTINGS_UPDATED: 'pasrs:settings-updated',

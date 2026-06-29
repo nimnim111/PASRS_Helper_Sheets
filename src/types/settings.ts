@@ -6,6 +6,9 @@ export interface Settings {
 	use_custom_replay_filter: boolean;
 	custom_replay_filter: string[];
 	clear_on_copy: boolean;
+	log_to_sheets: boolean;
+	sheets_spreadsheet_id: string;
+	sheets_sheet_name: string;
 }
 
 export type SettingsKey = keyof Settings;

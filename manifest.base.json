@@ -6,8 +6,19 @@
 	"icons": {
 		"128": "128.png"
 	},
-	"permissions": ["storage"],
-	"host_permissions": ["*://*.pokemonshowdown.com/*", "*://*.psim.us/*"],
+	"permissions": ["storage", "identity"],
+	"host_permissions": [
+		"*://*.pokemonshowdown.com/*",
+		"*://*.psim.us/*",
+		"https://sheets.googleapis.com/*"
+	],
+	"oauth2": {
+		"client_id": "REPLACE_WITH_YOUR_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com",
+		"scopes": ["https://www.googleapis.com/auth/spreadsheets"]
+	},
+	"background": {
+		"service_worker": "dist/background.js"
+	},
 	"content_scripts": [
 		{
 			"matches": ["*://play.pokemonshowdown.com/*", "*://*.psim.us/*"],

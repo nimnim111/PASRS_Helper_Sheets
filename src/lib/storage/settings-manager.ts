@@ -76,6 +76,9 @@ export class SettingsManager {
 			use_custom_replay_filter: false,
 			custom_replay_filter: [],
 			clear_on_copy: false,
+			log_to_sheets: false,
+			sheets_spreadsheet_id: '',
+			sheets_sheet_name: 'Sheet1',
 		};
 	}
 

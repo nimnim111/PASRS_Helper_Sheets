@@ -6,20 +6,20 @@ import {
 	getUrlFromData,
 } from '../../utils/showdown-data-utils';
 import {
-	isFormatMessage,
-	isBattleInitMessage,
 	isBattleFormatMessage,
-	isWinMessage,
+	isBattleInitMessage,
+	isForfeitCommand,
+	isFormatMessage,
 	isLeaveViewCommand,
 	isReplayUploadedMessage,
-	isForfeitCommand,
+	isWinMessage,
 } from '../../utils/showdown-protocol-utils';
-import { onSettingsUpdated } from '../events';
+import { copyToClipboardWithRetry } from '../browser/browser';
+import { onSettingsUpdated, sheetsRequest } from '../events';
 import { ReplaysManager } from '../storage/replays-manager';
 import { SettingsManager } from '../storage/settings-manager';
-import { copyToClipboardWithRetry } from '../browser/browser';
 import createPASRSRoom from './pasrs_room';
-import { App } from './room';
+import type { App } from './room';
 
 declare const app: App;
 
@@ -101,6 +101,30 @@ app.receive = (data: string) => {
 			if (replaysManager.getRoomState(roomId) === ReplayRoomState.Finished) {
 				if (settings.use_clipboard) {
 					copyToClipboardWithRetry(url, settings.notifications);
+				}
+
+				if (settings.log_to_sheets && settings.sheets_spreadsheet_id) {
+					const replay = replaysManager.getReplay(roomId);
+					if (replay) {
+						sheetsRequest('log', {
+							spreadsheetId: settings.sheets_spreadsheet_id,
+							sheetName: settings.sheets_sheet_name,
+							payload: {
+								format: replay.format ?? '',
+								p1: replay.p1,
+								p2: replay.p2,
+								result: replay.result,
+								url: replay.url,
+							},
+						}).then((response) => {
+							if (!response.ok) {
+								console.error(
+									'PASRS Helper: failed to log replay to Google Sheets',
+									response.error,
+								);
+							}
+						});
+					}
 				}
 
 				replaysManager.setRoomState(roomId, ReplayRoomState.Recorded);

@@ -33,7 +33,9 @@ function getProvidedChunkIds(code) {
 function getRequiredChunkIds(code) {
 	const ids = [];
 
-	for (const match of code.matchAll(/\.O\(void 0,\[([^\]]+)\],function\(\)\{return [^}]+\}\)/g)) {
+	for (const match of code.matchAll(
+		/\.O\(void 0,\[([^\]]+)\],function\(\)\{return [^}]+\}\)/g,
+	)) {
 		ids.push(
 			...match[1]
 				.split(',')
@@ -50,7 +52,10 @@ function getInjectedScriptFiles() {
 		(file) => file.endsWith('.js') && !file.endsWith('.LICENSE.txt'),
 	);
 	const codeByFile = new Map(
-		jsFiles.map((file) => [file, readFileSync(resolve(distDir, file), 'utf-8')]),
+		jsFiles.map((file) => [
+			file,
+			readFileSync(resolve(distDir, file), 'utf-8'),
+		]),
 	);
 	const chunkIdToFile = new Map();
 
@@ -65,6 +70,7 @@ function getInjectedScriptFiles() {
 		if (
 			!file ||
 			file === 'extension.js' ||
+			file === 'background.js' ||
 			orderedScripts.includes(file)
 		) {
 			return;
@@ -85,7 +91,11 @@ function getInjectedScriptFiles() {
 	}
 
 	for (const file of [...jsFiles].sort()) {
-		if (!['extension.js', 'react.js', 'showdown.js'].includes(file)) {
+		if (
+			!['extension.js', 'background.js', 'react.js', 'showdown.js'].includes(
+				file,
+			)
+		) {
 			addScript(file);
 		}
 	}
@@ -100,13 +110,23 @@ function writeExtensionLoader() {
 	const scriptFiles = getInjectedScriptFiles();
 	const reactScripts = scriptFiles.filter((file) => file !== 'showdown.js');
 	const showdownScript = scriptFiles.find((file) => file === 'showdown.js');
+	// Preserve the compiled content-script logic (e.g. the Sheets relay) and
+	// append the page-script injector below it. extension.js runs in the
+	// content-script context, which has chrome.* access.
+	const extensionPath = resolve(distDir, 'extension.js');
+	const compiled = readFileSync(extensionPath, 'utf-8');
 	const output = [
+		compiled,
 		'(()=>{',
-			'const injectScript=(file)=>{const script=document.createElement("script");script.src=chrome.runtime.getURL(file);script.onload=()=>script.remove();(document.head||document.documentElement).append(script);};',
-			'const injectStyle=(file)=>{const style=document.createElement("link");style.rel="stylesheet";style.href=chrome.runtime.getURL(file);(document.head||document.documentElement).append(style);};',
-			...reactScripts.map((file) => `injectScript(${JSON.stringify(`dist/${file}`)});`),
-			'injectStyle("dist/react.css");',
-			...(showdownScript ? [`injectScript(${JSON.stringify(`dist/${showdownScript}`)});`] : []),
+		'const injectScript=(file)=>{const script=document.createElement("script");script.src=chrome.runtime.getURL(file);script.onload=()=>script.remove();(document.head||document.documentElement).append(script);};',
+		'const injectStyle=(file)=>{const style=document.createElement("link");style.rel="stylesheet";style.href=chrome.runtime.getURL(file);(document.head||document.documentElement).append(style);};',
+		...reactScripts.map(
+			(file) => `injectScript(${JSON.stringify(`dist/${file}`)});`,
+		),
+		'injectStyle("dist/react.css");',
+		...(showdownScript
+			? [`injectScript(${JSON.stringify(`dist/${showdownScript}`)});`]
+			: []),
 		'})();',
 	].join('');
 

@@ -6,8 +6,8 @@
 Helper extension for PASRS & [Pokemon Showdown](https://play.pokemonshowdown.com/) that automatically uploads the replay of your battles in PSD.<br>
 Your replays are stored in session storage and can be seen in the side panel for the PASRS Helper, where you can see the result and click them to copy the URL for the match.
 
-## Planned features
-- Google Sheets integration for logging replays automatically
+## Features
+- Google Sheets integration for logging replays automatically — see the [setup guide](.github/CONTRIBUTING.md#google-sheets-integration)
 
 ## Building from source
 
