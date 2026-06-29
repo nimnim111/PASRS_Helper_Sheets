@@ -1,54 +1,3 @@
-import type { TeamMon } from '../types/replay';
-
-// The Showdown client exposes a global `Dex` we can use to turn internal ids
-// (e.g. "focussash") into display names (e.g. "Focus Sash"). It isn't typed, and
-// may not always be present, so everything here is defensive.
-declare const Dex:
-	| {
-			items?: { get?: (id: string) => { name?: string } };
-			moves?: { get?: (id: string) => { name?: string } };
-			species?: { get?: (id: string) => { spriteid?: string } };
-	  }
-	| undefined;
-
-// Pokémon HOME official artwork; covers modern (gen 8/9) species as static PNGs.
-const SPRITE_BASE = 'https://play.pokemonshowdown.com/sprites/home';
-
-function spriteUrl(species: string): string {
-	if (!species) return '';
-	let id = '';
-	try {
-		id = Dex?.species?.get?.(species)?.spriteid ?? '';
-	} catch {
-		id = '';
-	}
-	// Fallback id: lowercase, drop spaces/apostrophes/periods, keep forme hyphens.
-	if (!id) id = species.toLowerCase().replace(/[^a-z0-9-]/g, '');
-	return id ? `${SPRITE_BASE}/${id}.png` : '';
-}
-
-function prettyItem(id: string): string {
-	if (!id) return '';
-	try {
-		return Dex?.items?.get?.(id)?.name || id;
-	} catch {
-		return id;
-	}
-}
-
-function prettyMove(id: string): string {
-	if (!id) return '';
-	try {
-		return Dex?.moves?.get?.(id)?.name || id;
-	} catch {
-		return id;
-	}
-}
-
-export function isRequestMessage(data: string): boolean {
-	return data.includes('|request|');
-}
-
 export function isPlayerMessage(data: string): boolean {
 	return data.includes('|player|');
 }
@@ -61,60 +10,53 @@ export function isRatingMessage(data: string): boolean {
 	return data.includes('|raw|') && data.includes('rating:');
 }
 
-interface ParsedRequest {
-	side: 'p1' | 'p2';
-	team: TeamMon[];
-	species: string[];
+export function isBattleEventMessage(data: string): boolean {
+	return (
+		data.includes('|switch|') ||
+		data.includes('|drag|') ||
+		data.includes('|-terastallize|') ||
+		data.includes('|rule|')
+	);
+}
+
+export interface BattleEvents {
+	switches: Array<{ side: 'p1' | 'p2'; position: string; species: string }>;
+	teras: Array<{ side: 'p1' | 'p2'; position: string; type: string }>;
+	ots: boolean;
 }
 
 /**
- * Parse the player's own team (species, item, moves) from a `|request|` message.
- * The request payload is private to the player and is the only place that
- * carries the full team including items and moves.
+ * Parse switch-ins (which Pokémon were brought, in order), Terastallizations
+ * (position + type), and whether the format is Open Team Sheet.
  */
-export function parseRequestTeam(data: string): ParsedRequest | null {
-	const line = data.split('\n').find((l) => l.startsWith('|request|'));
-	if (!line) return null;
+export function parseBattleEvents(data: string): BattleEvents {
+	const switches: BattleEvents['switches'] = [];
+	const teras: BattleEvents['teras'] = [];
+	let ots = false;
 
-	const json = line.slice('|request|'.length).trim();
-	if (!json) return null;
-
-	let parsed: {
-		side?: {
-			id?: string;
-			pokemon?: Array<{ details?: string; item?: string; moves?: string[] }>;
-		};
-	};
-	try {
-		parsed = JSON.parse(json);
-	} catch {
-		return null;
+	for (const line of data.split('\n')) {
+		if (line.startsWith('|switch|') || line.startsWith('|drag|')) {
+			const parts = line.split('|'); // ['', 'switch', 'p1a: Nick', 'Species, L50, M', hp]
+			const position = (parts[2] ?? '').split(':')[0].trim(); // p1a
+			const species = (parts[3] ?? '').split(',')[0].trim();
+			const side = position.slice(0, 2);
+			if ((side === 'p1' || side === 'p2') && species) {
+				switches.push({ side, position, species });
+			}
+		} else if (line.startsWith('|-terastallize|')) {
+			const parts = line.split('|'); // ['', '-terastallize', 'p1a: Nick', 'Fairy']
+			const position = (parts[2] ?? '').split(':')[0].trim();
+			const type = (parts[3] ?? '').trim();
+			const side = position.slice(0, 2);
+			if ((side === 'p1' || side === 'p2') && type) {
+				teras.push({ side, position, type });
+			}
+		} else if (line.startsWith('|rule|')) {
+			if (line.toLowerCase().includes('open team sheet')) ots = true;
+		}
 	}
 
-	const sideId = parsed.side?.id;
-	const pokemon = parsed.side?.pokemon;
-	if ((sideId !== 'p1' && sideId !== 'p2') || !Array.isArray(pokemon)) {
-		return null;
-	}
-
-	const team: TeamMon[] = pokemon.map((mon) => {
-		const species = (mon.details ?? '').split(',')[0].trim();
-		const moves = Array.isArray(mon.moves)
-			? mon.moves.map(prettyMove).join(' / ')
-			: '';
-		return {
-			species,
-			item: prettyItem(mon.item ?? ''),
-			moves,
-			sprite: spriteUrl(species),
-		};
-	});
-
-	return {
-		side: sideId,
-		team,
-		species: team.map((mon) => mon.species).filter(Boolean),
-	};
+	return { switches, teras, ots };
 }
 
 /**

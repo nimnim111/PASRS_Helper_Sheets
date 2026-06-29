@@ -140,7 +140,6 @@ export function Settings() {
 				<SheetsSettings
 					logToSheets={settings.log_to_sheets}
 					spreadsheetId={settings.sheets_spreadsheet_id}
-					sheetName={settings.sheets_sheet_name}
 					onCheckboxChange={handleCheckboxChange}
 					onTextChange={handleTextChange}
 				/>

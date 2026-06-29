@@ -1,4 +1,4 @@
-import type { RoomReplay, TeamMon } from '../types/replay';
+import type { RoomReplay } from '../types/replay';
 import type { Settings } from '../types/settings';
 
 // Cross-context RPC (page <-> content script) for Google Sheets logging.
@@ -18,21 +18,21 @@ export type SheetsAction =
 	| 'log'
 	| 'spreadsheet';
 
+// Fields for one row of the PASRS 4.3 "GBG Data" sheet.
 export interface SheetsLogPayload {
-	format: string;
-	p1: string;
-	p2: string;
-	result: string;
-	url: string;
-	// Battle details (optional; absent for unrated/unknown data).
-	mySide?: 'p1' | 'p2';
-	myTeam?: TeamMon[];
-	myTeamSpecies?: string[];
-	oppTeamSpecies?: string[];
-	myEloBefore?: string;
-	myEloAfter?: string;
-	myEloDelta?: string;
-	oppElo?: string;
+	result: string; // 'Win' | 'Loss' | 'Draw'
+	oppName: string;
+	oppTeam: string[]; // opponent's revealed 6 species (F–K)
+	myPicks: string[]; // your brought 4: lead1, lead2, back1, back2 (O–R)
+	oppPicks: string[]; // opp brought 4: lead1, lead2, back1, back2 (T–W)
+	myTeraMon: string;
+	myTeraType: string;
+	oppTeraMon: string;
+	oppTeraType: string;
+	ots: boolean;
+	myEloBefore: string;
+	myEloAfter: string;
+	oppElo: string;
 }
 
 export interface SheetsRequestData {

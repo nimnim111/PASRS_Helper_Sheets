@@ -63,7 +63,6 @@ const GuideLink = styled.a`
 interface SheetsSettingsProps {
 	logToSheets: boolean;
 	spreadsheetId: string;
-	sheetName: string;
 	onCheckboxChange: (key: SettingsKey, value: boolean) => void;
 	onTextChange: (key: SettingsKey, value: string) => void;
 }
@@ -71,7 +70,6 @@ interface SheetsSettingsProps {
 export function SheetsSettings({
 	logToSheets,
 	spreadsheetId,
-	sheetName,
 	onCheckboxChange,
 	onTextChange,
 }: SheetsSettingsProps) {
@@ -124,35 +122,26 @@ export function SheetsSettings({
 		setStatus('');
 		const res = await sheetsRequest('log', {
 			spreadsheetId,
-			sheetName,
 			payload: {
-				format: 'TEST',
-				p1: 'You',
-				p2: 'Opponent',
-				result: 'win',
-				url: 'https://replay.pokemonshowdown.com/test',
-				mySide: 'p1',
-				myTeam: [
-					{
-						species: 'Calyrex-Shadow',
-						item: 'Focus Sash',
-						moves: 'Astral Barrage',
-						sprite:
-							'https://play.pokemonshowdown.com/sprites/home/calyrex-shadow.png',
-					},
-					{
-						species: 'Miraidon',
-						item: 'Choice Specs',
-						moves: 'Electro Drift',
-						sprite:
-							'https://play.pokemonshowdown.com/sprites/home/miraidon.png',
-					},
+				result: 'Win',
+				oppName: 'TestOpponent',
+				oppTeam: [
+					'Koraidon',
+					'Flutter Mane',
+					'Urshifu-Rapid-Strike',
+					'Rillaboom',
+					'Incineroar',
+					'Amoonguss',
 				],
-				myTeamSpecies: ['Calyrex-Shadow', 'Miraidon'],
-				oppTeamSpecies: ['Koraidon', 'Flutter Mane'],
+				myPicks: ['Calyrex-Shadow', 'Miraidon', 'Urshifu', 'Whimsicott'],
+				oppPicks: ['Koraidon', 'Flutter Mane', 'Rillaboom', 'Incineroar'],
+				myTeraMon: 'Calyrex-Shadow',
+				myTeraType: 'Ghost',
+				oppTeraMon: 'Flutter Mane',
+				oppTeraType: 'Fairy',
+				ots: true,
 				myEloBefore: '1500',
 				myEloAfter: '1516',
-				myEloDelta: '+16',
 				oppElo: '1490',
 			},
 		});
@@ -205,14 +194,7 @@ export function SheetsSettings({
 			<SettingsTextInput
 				settingsKey="sheets_spreadsheet_id"
 				value={spreadsheetId}
-				placeholder="Spreadsheet ID (leave blank to auto-create)"
-				onChange={onTextChange}
-				disabled={!logToSheets}
-			/>
-			<SettingsTextInput
-				settingsKey="sheets_sheet_name"
-				value={sheetName}
-				placeholder="Sheet/tab name (e.g. Sheet1)"
+				placeholder="PASRS spreadsheet ID"
 				onChange={onTextChange}
 				disabled={!logToSheets}
 			/>
@@ -220,14 +202,14 @@ export function SheetsSettings({
 			<HintText>
 				{sheetUrl ? (
 					<>
-						Logging to{' '}
+						Logging to the{' '}
 						<a href={sheetUrl} target="_blank" rel="noopener noreferrer">
-							your spreadsheet
-						</a>
-						.
+							GBG Data
+						</a>{' '}
+						sheet.
 					</>
 				) : (
-					'Leave the ID blank and a spreadsheet will be created automatically on your first replay.'
+					'Upload the PASRS 4.3 template to Google Sheets and paste its spreadsheet ID (from the URL).'
 				)}
 			</HintText>
 

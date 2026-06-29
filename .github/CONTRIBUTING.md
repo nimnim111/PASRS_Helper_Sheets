@@ -12,21 +12,18 @@ Please follow the guidelines below to ensure a smooth contribution process.
 
 
 ## Google Sheets Integration
-PASRS Helper can append every recorded replay to a Google Sheet using OAuth and
-the official Google Sheets API. Users sign in with their Google account from the
-settings panel; replay data goes directly from the extension to Google's API
-(no third party in between).
+PASRS Helper logs every recorded battle into the **PASRS 4.3** tracking
+spreadsheet using OAuth and the official Google Sheets API. Users sign in with
+their Google account from the settings panel; data goes directly from the
+extension to Google's API (no third party in between).
 
-Replays are segmented by the team you played: each unique set of six species
-gets its own tab ("Team 1", "Team 2", …) with the team (species, item, moves)
-at the top, followed by a battle table. Columns: `Timestamp, Format, You,
-Opponent, Result, Your Elo, Elo Change, Opp Elo, Opp Team, Opp Pokepaste,
-Replay URL`. The Opp Pokepaste links to an auto-created
-[pokepast.es](https://pokepast.es) paste of the opponent's revealed species
-(species only — their items/moves aren't known). Keeping
-the same species but changing items/moves inserts a "Team updated" marker row in
-the same tab; changing a species starts a new tab. Elo columns are populated for
-rated games only.
+It appends a row to the template's **`GBG Data`** sheet (the raw-input sheet the
+template's dashboards are computed from). Per battle it fills: Game number,
+Result, opponent name, the opponent's revealed six species, your four picks
+(leads + backs), their four picks, both sides' Tera Pokémon + type, OTS, your
+Elo (`before -> after`) and the opponent's Elo. Picks come from switch-in order,
+Tera from `|-terastallize|`, OTS from the battle rules, and Elo from rated games
+only.
 
 ### How it's wired (for contributors)
 The page-injected scripts cannot use `chrome.*`, and OAuth can only run in a
@@ -40,8 +37,10 @@ page (React panel / showdown hook)
 ```
 
 - `src/lib/events.ts` — the page<->content RPC (`sheetsRequest` / `onSheetsRequest`).
-- `src/background/index.ts` — OAuth + Sheets API calls (`auth`, `status`, `signout`, `log`).
-- `src/components/ui/SheetsSettings.tsx` — sign-in UI + spreadsheet ID / sheet name.
+- `src/utils/showdown-battle-utils.ts` — parses players, opponent species, switches, Tera, OTS, and rating changes from the protocol.
+- `src/lib/showdown/showdown.ts` — accumulates battle details and builds the GBG Data row payload (`buildGbgPayload`).
+- `src/background/index.ts` — OAuth + Sheets API calls (`auth`, `status`, `signout`, `log`); appends to `GBG Data`.
+- `src/components/ui/SheetsSettings.tsx` — sign-in UI + spreadsheet ID.
 
 Auth uses `chrome.identity.launchWebAuthFlow` (the OAuth popup) on **every**
 browser — Chrome, Chromium forks (Brave, Edge, …) and Firefox. We deliberately
@@ -78,15 +77,17 @@ make sign-in work you must create your own OAuth client:
 > ~100 test users.
 
 ### User setup
-1. In the PASRS Helper side panel → **Settings → Google Sheets**, enable
-   **Log recorded replays to Google Sheets**.
-2. Click **Sign in with Google** and grant access.
-3. Leave the **Spreadsheet ID** blank to have the extension create (and reuse) a
-   "PASRS Helper Replays" sheet automatically, or paste an existing spreadsheet
-   ID to log into your own. Set the **tab name** only if it isn't `Sheet1`.
+1. Make a copy of the **PASRS 4.3** spreadsheet in your own Google Drive (File →
+   Make a copy, or upload the `.xlsx` and open it as a Google Sheet). It must
+   contain the `GBG Data` sheet.
+2. Copy its **spreadsheet ID** from the URL
+   (`https://docs.google.com/spreadsheets/d/<THIS_PART>/edit`).
+3. In the PASRS Helper side panel → **Settings → Google Sheets**, enable
+   **Log recorded replays to Google Sheets**, click **Sign in with Google**, and
+   paste the spreadsheet ID.
 
-From then on, each recorded replay appends a row to your sheet. The settings
-panel shows a link to whichever sheet is being used.
+From then on, each recorded battle appends a row to the `GBG Data` sheet and the
+template's dashboards update automatically.
 
 ## Maintainers / Credits
 The project is maintained by the following individuals:<br>

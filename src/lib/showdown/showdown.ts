@@ -1,13 +1,17 @@
-import { ReplayRoomState } from '../../types/replay';
 import {
+	ReplayRoomResult,
+	ReplayRoomState,
+	type RoomReplay,
+} from '../../types/replay';
+import {
+	isBattleEventMessage,
 	isPlayerMessage,
 	isRatingMessage,
-	isRequestMessage,
 	isTeamPreviewMessage,
+	parseBattleEvents,
 	parseOpponentSpecies,
 	parsePlayers,
 	parseRatingChange,
-	parseRequestTeam,
 } from '../../utils/showdown-battle-utils';
 import {
 	getFormatFromData,
@@ -26,7 +30,11 @@ import {
 	isWinMessage,
 } from '../../utils/showdown-protocol-utils';
 import { copyToClipboardWithRetry } from '../browser/browser';
-import { onSettingsUpdated, sheetsRequest } from '../events';
+import {
+	type SheetsLogPayload,
+	onSettingsUpdated,
+	sheetsRequest,
+} from '../events';
 import { ReplaysManager } from '../storage/replays-manager';
 import { SettingsManager } from '../storage/settings-manager';
 import createPASRSRoom from './pasrs_room';
@@ -67,14 +75,32 @@ function collectBattleDetails(data: string): void {
 		});
 	}
 
-	if (isRequestMessage(data)) {
-		const parsed = parseRequestTeam(data);
-		if (parsed) {
-			replaysManager.mergeReplay(roomId, {
-				mySide: parsed.side,
-				myTeam: parsed.team,
-				myTeamSpecies: parsed.species,
-			});
+	if (isBattleEventMessage(data)) {
+		const events = parseBattleEvents(data);
+		const replay = replaysManager.getReplay(roomId);
+		if (replay) {
+			const positions = { ...(replay.positions ?? {}) };
+			const p1Picks = [...(replay.p1Picks ?? [])];
+			const p2Picks = [...(replay.p2Picks ?? [])];
+			for (const sw of events.switches) {
+				positions[sw.position] = sw.species;
+				const picks = sw.side === 'p1' ? p1Picks : p2Picks;
+				if (!picks.includes(sw.species)) picks.push(sw.species);
+			}
+
+			const patch: Partial<typeof replay> = { positions, p1Picks, p2Picks };
+			for (const tera of events.teras) {
+				const species = positions[tera.position] ?? '';
+				if (tera.side === 'p1') {
+					patch.p1TeraMon = species;
+					patch.p1TeraType = tera.type;
+				} else {
+					patch.p2TeraMon = species;
+					patch.p2TeraType = tera.type;
+				}
+			}
+			if (events.ots) patch.ots = true;
+			replaysManager.mergeReplay(roomId, patch);
 		}
 	}
 
@@ -97,11 +123,47 @@ function collectBattleDetails(data: string): void {
 				replaysManager.mergeReplay(roomId, {
 					myEloBefore: change.before,
 					myEloAfter: change.after,
-					myEloDelta: change.delta,
 				});
 			}
 		}
 	}
+}
+
+function resultLabel(result: ReplayRoomResult): string {
+	switch (result) {
+		case ReplayRoomResult.Win:
+			return 'Win';
+		case ReplayRoomResult.Loss:
+			return 'Loss';
+		case ReplayRoomResult.Draw:
+			return 'Draw';
+		default:
+			return '';
+	}
+}
+
+// Map a collected replay onto one PASRS GBG Data row, resolving "my"/"opp" from
+// the player's side.
+function buildGbgPayload(replay: RoomReplay): SheetsLogPayload {
+	const mine = replay.mySide ?? 'p1';
+	const isP1 = mine === 'p1';
+	const pick = <T>(p1Value: T, p2Value: T): T => (isP1 ? p1Value : p2Value);
+
+	return {
+		result: resultLabel(replay.result),
+		oppName: isP1 ? replay.p2 : replay.p1,
+		oppTeam: replay.oppTeamSpecies ?? [],
+		myPicks: pick(replay.p1Picks, replay.p2Picks) ?? [],
+		oppPicks: pick(replay.p2Picks, replay.p1Picks) ?? [],
+		myTeraMon: pick(replay.p1TeraMon, replay.p2TeraMon) ?? '',
+		myTeraType: pick(replay.p1TeraType, replay.p2TeraType) ?? '',
+		oppTeraMon: pick(replay.p2TeraMon, replay.p1TeraMon) ?? '',
+		oppTeraType: pick(replay.p2TeraType, replay.p1TeraType) ?? '',
+		ots: replay.ots ?? false,
+		myEloBefore: replay.myEloBefore ?? pick(replay.p1Elo, replay.p2Elo) ?? '',
+		myEloAfter: replay.myEloAfter ?? '',
+		oppElo: pick(replay.p2Elo, replay.p1Elo) ?? '',
+	};
 }
 
 app.receive = (data: string) => {
@@ -178,28 +240,9 @@ app.receive = (data: string) => {
 				if (settings.log_to_sheets) {
 					const replay = replaysManager.getReplay(roomId);
 					if (replay) {
-						const oppElo = replay.mySide === 'p2' ? replay.p1Elo : replay.p2Elo;
-						const myEloBefore =
-							replay.myEloBefore ??
-							(replay.mySide === 'p2' ? replay.p2Elo : replay.p1Elo);
 						sheetsRequest('log', {
 							spreadsheetId: settings.sheets_spreadsheet_id,
-							sheetName: settings.sheets_sheet_name,
-							payload: {
-								format: replay.format ?? '',
-								p1: replay.p1,
-								p2: replay.p2,
-								result: replay.result,
-								url: replay.url,
-								mySide: replay.mySide,
-								myTeam: replay.myTeam,
-								myTeamSpecies: replay.myTeamSpecies,
-								oppTeamSpecies: replay.oppTeamSpecies,
-								myEloBefore,
-								myEloAfter: replay.myEloAfter,
-								myEloDelta: replay.myEloDelta,
-								oppElo,
-							},
+							payload: buildGbgPayload(replay),
 						}).then((response) => {
 							if (!response.ok) {
 								console.error(
