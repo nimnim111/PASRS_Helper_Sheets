@@ -298,6 +298,28 @@ async function ensureSpreadsheetId(
 	return created.id;
 }
 
+// The set of tab titles actually present in the spreadsheet, so we can reconcile
+// stored metadata with reality (the two can drift if a previous run failed or
+// the user edited the sheet).
+async function getSheetTitles(
+	tokenRef: TokenRef,
+	spreadsheetId: string,
+): Promise<Set<string>> {
+	const res = await sheetsCall(
+		tokenRef,
+		`${spreadsheetId}?fields=sheets.properties.title`,
+		'GET',
+	);
+	await expectOk(res);
+	const json = (await res.json()) as {
+		sheets?: Array<{ properties?: { title?: string } }>;
+	};
+	const titles = (json.sheets ?? [])
+		.map((sheet) => sheet.properties?.title)
+		.filter((title): title is string => Boolean(title));
+	return new Set(titles);
+}
+
 function speciesKeyOf(species: string[]): string {
 	if (species.length === 0) return 'unknown';
 	return [...species]
@@ -462,22 +484,14 @@ async function createTeamTab(
 	team: TeamMon[],
 	meta: SpreadsheetMeta,
 ): Promise<void> {
-	// Add the tab and, for auto-created spreadsheets, drop the stray empty
-	// default sheet in the same batch.
-	const requests: unknown[] = [
-		{ addSheet: { properties: { title: tabName } } },
-	];
-	const deletingDefault =
-		meta.defaultSheetId != null && !meta.defaultSheetDeleted;
-	if (deletingDefault) {
-		requests.push({ deleteSheet: { sheetId: meta.defaultSheetId } });
-	}
-
+	// Add the tab on its own. (batchUpdate is atomic, so this must not be bundled
+	// with the best-effort default-sheet delete below — a bad delete would
+	// otherwise roll back the tab creation too.)
 	const addRes = await sheetsCall(
 		tokenRef,
 		`${spreadsheetId}:batchUpdate`,
 		'POST',
-		{ requests },
+		{ requests: [{ addSheet: { properties: { title: tabName } } }] },
 	);
 	// "Already exists" (400): the tab is there but we can't get its id, so just
 	// leave it as-is (appends still work) without clobbering existing content.
@@ -485,12 +499,27 @@ async function createTeamTab(
 		if (addRes.status !== 400) await expectOk(addRes);
 		return;
 	}
-	if (deletingDefault) meta.defaultSheetDeleted = true;
 
 	const replies = (await addRes.json()) as {
 		replies?: Array<{ addSheet?: { properties?: { sheetId?: number } } }>;
 	};
 	const sheetId = replies.replies?.[0]?.addSheet?.properties?.sheetId;
+
+	// Best-effort: drop the stray empty default sheet of auto-created
+	// spreadsheets. Failure here must not break logging.
+	if (meta.defaultSheetId != null && !meta.defaultSheetDeleted) {
+		try {
+			const delRes = await sheetsCall(
+				tokenRef,
+				`${spreadsheetId}:batchUpdate`,
+				'POST',
+				{ requests: [{ deleteSheet: { sheetId: meta.defaultSheetId } }] },
+			);
+			if (delRes.ok) meta.defaultSheetDeleted = true;
+		} catch {
+			// ignore
+		}
+	}
 
 	await writeRange(
 		tokenRef,
@@ -590,15 +619,30 @@ async function handleLog(data?: SheetsRequestData): Promise<SheetsResponse> {
 		const key = speciesKeyOf(payload.myTeamSpecies ?? []);
 
 		const meta = allMeta[spreadsheetId] ?? { teamCount: 0, teams: {} };
+		const titles = await getSheetTitles(tokenRef, spreadsheetId);
 		let teamMeta = meta.teams[key];
 
 		if (!teamMeta) {
-			meta.teamCount += 1;
-			const tabName = `Team ${meta.teamCount}`;
-			await createTeamTab(tokenRef, spreadsheetId, tabName, team, meta);
-			teamMeta = { tabName, detail: team };
+			// Pick a tab name not already taken in the spreadsheet.
+			do {
+				meta.teamCount += 1;
+			} while (titles.has(`Team ${meta.teamCount}`));
+			teamMeta = { tabName: `Team ${meta.teamCount}`, detail: team };
 			meta.teams[key] = teamMeta;
+		}
+
+		if (!titles.has(teamMeta.tabName)) {
+			// Tab is missing (new team, or meta drifted from the sheet): create it.
+			await createTeamTab(
+				tokenRef,
+				spreadsheetId,
+				teamMeta.tabName,
+				team,
+				meta,
+			);
+			teamMeta.detail = team;
 		} else {
+			// Existing tab: note any item/move changes before logging the battle.
 			const changes = describeTeamChanges(teamMeta.detail, team);
 			if (changes) {
 				await appendRows(tokenRef, spreadsheetId, teamMeta.tabName, [
