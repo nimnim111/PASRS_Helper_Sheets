@@ -1,32 +1,23 @@
-// Faithful TypeScript port of the PASRS template's `REPLAYTODATA` Apps Script
-// function. The template's dashboards are driven by plain spreadsheet formulas
-// that read a per-game "spill" row out of the `Base Data` sheet; that row is
-// normally produced by the bound Apps Script (`=REPLAYTODATA(replayURL)`).
+// Faithful TypeScript port of the PASRS 7 `REPLAYTODATA` Apps Script function.
+// The template's dashboards are driven by plain spreadsheet formulas that read
+// a per-game "spill" row out of the `Base Data` sheet.
 //
-// Because an xlsx export of the sheet loses its bound script (the custom
-// function becomes `#NAME?`), the extension reproduces the exact same output
-// array here and writes it into `Base Data` itself. The template's helper
-// columns + `GBG Data` + every dashboard then compute identically — no script.
-//
-// The output column order MUST match what the template's helper formulas read
-// (verified against the PASRS 4.3 layout):
+// Output column order (matches PASRS 7 Base Data layout, starting at col B):
 //   B            p1
 //   C..H         team1[0..5]
 //   I            p2
 //   J..O         team2[0..5]
-//   P            winner (1 or 2, numeric)
-//   Q..T         p1TeraMon, p1TeraType, p2TeraMon, p2TeraType
+//   P            winner (1 or 2)
+//   Q..T         p1MegaMon, "", p2MegaMon, "" (Champions format — no Tera)
 //   U..X         team1leads[0..1], team2leads[0..1]
 //   Y            "ots" | "cts"
 //   Z..AC        p1StartELO, p2StartELO, p1EndELO, p2EndELO
-//   AD           (spacer)
-//   AE..AH       team1used[0..3]
-//   AI..AL       team2used[0..3]
-//   AM..         "P1 MOVES START", p1 combos…, "P1 MOVES END",
+//   AD..AG       bo3("true"|""), setGameCount, lastGame("yes"/"no"|""), timestamp
+//   AH..AM       "p1: 0", alignLeft, "vs", alignRight, "p2: 0", url
+//   AN..AQ       team1used[0..3]
+//   AR..AU       team2used[0..3]
+//   AV..         "P1 MOVES START", p1 combos…, "P1 MOVES END",
 //                "P2 MOVES START", p2 combos…, "P2 MOVES END"
-//
-// A move combo is `nickname:move:count` (the template keys moves by the
-// in-battle nickname, exactly as the original script did).
 
 type Cell = string | number;
 
@@ -78,8 +69,6 @@ interface Nickname {
 	nickname: string;
 }
 
-// Replaces HTML entities so a player name parsed from a `|raw|` rating line
-// matches the `|player|` name.
 function fixSpecialChars(text: string): string {
 	return text
 		.replace(/&#39;/g, "'")
@@ -90,15 +79,15 @@ function fixSpecialChars(text: string): string {
 		.replace(/&apos;/g, "'");
 }
 
-// Normalise the species names Showdown reports differently on switch-in so the
-// "used"/"leads"/tera bookkeeping lines up with team preview.
 function normaliseSwitchName(name: string): string {
 	let mon = name;
 	if (mon === 'Palafin-Hero') mon = 'Palafin';
-	if (mon === 'Terapagos-Terastal' || mon === 'Terapagos-Stellar')
-		mon = 'Terapagos';
+	if (mon === 'Terapagos-Terastal' || mon === 'Terapagos-Stellar') mon = 'Terapagos';
 	if (mon.includes('-Teal-Tera')) mon = 'Ogerpon';
 	if (mon.includes('-Tera')) mon = mon.replace('-Tera', '');
+	if (mon.includes('-Mega-Y')) mon = mon.replace('-Mega-Y', '');
+	if (mon.includes('-Mega-X')) mon = mon.replace('-Mega-X', '');
+	if (mon.includes('-Mega')) mon = mon.replace('-Mega', '');
 	return mon;
 }
 
@@ -109,11 +98,18 @@ export function replayToData(url: string, jsonText: string): Cell[] {
 	const replay = JSON.parse(jsonText) as ReplayJson;
 	const gameLog = (replay.log ?? '').split('\n');
 	const format = replay.format ?? '';
+	const timestamp = replay.uploadtime;
 
 	let ladder = false;
 	let ots = false;
 	let numPlayersAgreeToOTS = 0;
 	let hasELO = false;
+
+	let setGameCount = '';
+	const setP1winCount = 0;
+	const setP2winCount = 0;
+	let advantagePlayer = '';
+	let lastGameOfSet = false;
 
 	let p1 = '';
 	let p2 = '';
@@ -121,6 +117,9 @@ export function replayToData(url: string, jsonText: string): Cell[] {
 	let p1EndELO: string | undefined;
 	let p2StartELO: string | undefined;
 	let p2EndELO: string | undefined;
+
+	let alignLeftPlayer: string | undefined;
+	let alignRightPlayer: string | undefined;
 
 	const team1: string[] = [];
 	const team2: string[] = [];
@@ -130,10 +129,15 @@ export function replayToData(url: string, jsonText: string): Cell[] {
 	const team2used: string[] = [];
 	const team1nicknames: Nickname[] = [];
 	const team2nicknames: Nickname[] = [];
+
+	// Tera vars kept for tracking but not output in PASRS 7
 	let p1TeraMon: string | undefined;
 	let p2TeraMon: string | undefined;
 	let p1TeraType: string | undefined;
 	let p2TeraType: string | undefined;
+
+	let p1MegaMon: string | undefined;
+	let p2MegaMon: string | undefined;
 
 	const p1Moves = new MoveManager();
 	const p2Moves = new MoveManager();
@@ -143,6 +147,22 @@ export function replayToData(url: string, jsonText: string): Cell[] {
 	for (let logIndex = 0; logIndex < gameLog.length; logIndex++) {
 		const line = gameLog[logIndex];
 		const tokens = line.split('|');
+
+		if (tokens[1] === 'html' && tokens[2]?.startsWith('<table width=')) {
+			alignLeftPlayer = tokens[2].split('<td align="left">')[1]?.split('</td>')[0];
+			alignRightPlayer = tokens[2].split('<td align="right">')[1]?.split('</tr>')[0];
+			if (alignLeftPlayer && alignRightPlayer) {
+				const afterRight = tokens[2].split(alignRightPlayer)[1] ?? '';
+				const parts = afterRight.split('align="right"');
+				if (parts[0]?.includes('"fa fa-circle"')) advantagePlayer = alignLeftPlayer;
+				if (parts[1]?.includes('"fa fa-circle"')) advantagePlayer = alignRightPlayer;
+			}
+		}
+
+		if (tokens[1] === 'uhtml' && tokens[2] === 'bestof') {
+			setGameCount = tokens[3]?.charAt(17) ?? '';
+			if (setGameCount === '3') lastGameOfSet = true;
+		}
 
 		if (tokens[1] === 'player') {
 			if (tokens[2] === 'p1' && p1 === '') p1 = tokens[3];
@@ -158,10 +178,7 @@ export function replayToData(url: string, jsonText: string): Cell[] {
 			const idstuff = tokens[2].split(': ');
 			const tempNickname = idstuff[1];
 			const monTempName = normaliseSwitchName(tokens[3].split(',')[0]);
-			const newNick: Nickname = {
-				realName: monTempName,
-				nickname: tempNickname,
-			};
+			const newNick: Nickname = { realName: monTempName, nickname: tempNickname };
 
 			if (idstuff[0].includes('1')) {
 				if (team1leads.length < 2 && !team1leads.includes(monTempName))
@@ -196,6 +213,30 @@ export function replayToData(url: string, jsonText: string): Cell[] {
 					if (idstuff[1] === nick.nickname) {
 						p2TeraMon = nick.realName;
 						p2TeraType = tokens[3];
+					}
+				}
+			}
+		}
+
+		if (tokens[1] === '-mega') {
+			const idstuff = tokens[2].split(': ');
+			const monNick = idstuff[1];
+			const stone = tokens[4] ?? '';
+			let stoneSuffix = '';
+			if (stone.endsWith('X')) stoneSuffix = '-X';
+			if (stone.endsWith('Y')) stoneSuffix = '-Y';
+
+			if (idstuff[0].includes('1')) {
+				for (const nick of team1nicknames) {
+					if (monNick === nick.nickname) {
+						p1MegaMon = nick.realName + stoneSuffix + '-Mega';
+					}
+				}
+			}
+			if (idstuff[0].includes('2')) {
+				for (const nick of team2nicknames) {
+					if (monNick === nick.nickname) {
+						p2MegaMon = nick.realName + stoneSuffix + '-Mega';
 					}
 				}
 			}
@@ -260,7 +301,9 @@ export function replayToData(url: string, jsonText: string): Cell[] {
 		}
 
 		if (tokens[1] === 'win') {
-			winoutp = tokens[2] === p1 ? 1 : 2;
+			const winner = tokens[2];
+			winoutp = winner === p1 ? 1 : 2;
+			if (winner === advantagePlayer) lastGameOfSet = true;
 		}
 		if (tokens[1] === 'rated') ladder = true;
 		if (tokens[1] === 'raw') {
@@ -286,17 +329,26 @@ export function replayToData(url: string, jsonText: string): Cell[] {
 	const bo3 = format.includes('(Bo3)');
 	if (bo3 && ladder) ots = true;
 
+	// suppress unused-variable warnings — Tera tracked but Champions format outputs
+	// Mega in Q-T (the REPLAYTODATA Tera push is commented out in the Apps Script)
+	void p1TeraMon;
+	void p1TeraType;
+	void p2TeraMon;
+	void p2TeraType;
+
 	const output: Array<Cell | undefined> = [];
+
 	output.push(p1);
 	for (let i = 0; i < 6; i++) output.push(team1[i]);
 	output.push(p2);
 	for (let i = 0; i < 6; i++) output.push(team2[i]);
 	output.push(winoutp);
 
-	output.push(p1TeraMon);
-	output.push(p1TeraType);
-	output.push(p2TeraMon);
-	output.push(p2TeraType);
+	// Q-T: Mega slots (matches REPLAYTODATA — p1Mega, "", p2Mega, "")
+	output.push(p1MegaMon);
+	output.push('');
+	output.push(p2MegaMon);
+	output.push('');
 
 	output.push(team1leads[0]);
 	output.push(team1leads[1]);
@@ -309,12 +361,30 @@ export function replayToData(url: string, jsonText: string): Cell[] {
 		output.push(p1StartELO, p2StartELO, p1EndELO, p2EndELO);
 	} else if (ladder) {
 		output.push('?', '?', '?', '?');
-	} else {
+	} else if (!ladder) {
 		output.push('---', '---', '---', '---');
+	} else {
+		output.push('', '', '', '');
 	}
 
-	// Spacer column (AD) — present in the template's expected layout.
-	output.push('');
+	// AD-AG: Bo3 metadata
+	if (bo3) {
+		output.push('true');
+		output.push(setGameCount);
+		if (hasELO) lastGameOfSet = true;
+		output.push(lastGameOfSet ? 'yes' : 'no');
+		output.push(timestamp);
+	} else {
+		output.push('', '', '', '');
+	}
+
+	// AH-AM: score placeholders + replay URL
+	output.push(`p1: ${setP1winCount}`);
+	output.push(alignLeftPlayer);
+	output.push('vs');
+	output.push(alignRightPlayer);
+	output.push(`p2: ${setP2winCount}`);
+	output.push(replayUrl);
 
 	output.push(team1used[0], team1used[1], team1used[2], team1used[3]);
 	output.push(team2used[0], team2used[1], team2used[2], team2used[3]);
@@ -334,11 +404,9 @@ export function replayToData(url: string, jsonText: string): Cell[] {
 	}
 	output.push('P2 MOVES END');
 
-	// Sheets has no concept of `undefined`; empty slots become blank cells.
 	return output.map((cell) => cell ?? '');
 }
 
-// The replay log lives at `<replay url>.json`. Mirrors the script's URL handling.
 export function replayJsonUrl(url: string): string {
 	let replayUrl = url;
 	if (replayUrl.slice(-3) === '?p2') replayUrl = replayUrl.slice(0, -3);

@@ -1,249 +1,122 @@
-// Faithful TypeScript port of the PASRS template's `TEAMDATAFROMPASTE` Apps
-// Script function. The "Usage Stats" dashboard reads the player's own team out
-// of the `Team Info From Paste` sheet, normally filled by
-// `=TRANSPOSE(TEAMDATAFROMPASTE(Paste))`. Like REPLAYTODATA this custom function
-// is lost on xlsx export, so the extension reproduces its output and writes it
-// down column A; the sheet's TRIM/VLOOKUP formulas then render the page.
+// Faithful TypeScript port of the PASRS 7 `importteam` Apps Script function
+// (the one bound to `Team Info From Paste!A1` via `=importteam(Paste)`).
 //
-// Output order (written down column A, A1 first), matching the formulas that
-// read it (name → A1, moves → A2..A5, tera (mon 1) → A31, nickname → A37):
-//   for each mon: name, move1, move2, move3, move4
-//   then every tera type
-//   then every nickname
-//   then the team title
+// It parses the raw Showdown paste text from a pokepaste's `/json` endpoint and
+// writes, down column A, 10 values per mon in this order:
+//   nickname-or-name, name, item, ability, tera, move1, move2, move3, move4, evs
+// (up to 6 mons). The sheet's TRIM/VLOOKUP formulas in columns C..S then read
+// those cells at fixed offsets, so the order/count must match exactly.
 //
-// The input is the raw HTML of a pokepaste page (e.g. https://pokepast.es/xxxx).
+// The input is the text body of `https://pokepast.es/xxxx/json`, whose `paste`
+// field contains the Showdown export with literal `\r\n` line breaks.
 
 interface PasteMon {
 	name: string;
 	nickname: string;
+	item: string;
+	ability: string;
 	tera: string;
 	moves: [string, string, string, string];
+	evs: string;
 }
 
-function fixSpecialChars(text: string): string {
+function fixUnicodeChars(text: string): string {
 	return text
-		.replace(/&#39;/g, "'")
-		.replace(/&#34;/g, '"')
-		.replace(/&amp;/g, '&')
-		.replace(/&gt;/g, '>')
-		.replace(/&lt;/g, '<')
-		.replace(/&apos;/g, "'");
+		.replace(/\\u2019/g, "'")
+		.replace(/\\u0022/g, '"')
+		.replace(/\\u0026/g, '&')
+		.replace(/\\u003e/g, '>')
+		.replace(/\\u003c/g, '<')
+		.replace(/\\u0027/g, "'");
 }
 
-const TERA_TYPES = [
-	'normal',
-	'fighting',
-	'flying',
-	'poison',
-	'ground',
-	'rock',
-	'bug',
-	'ghost',
-	'steel',
-	'fire',
-	'water',
-	'grass',
-	'electric',
-	'psychic',
-	'ice',
-	'dragon',
-	'dark',
-	'fairy',
-	'stellar',
-	'Stellar',
-];
+// Mirrors getPokemonName: strips gender tags, item, nickname parens, and
+// unifies a few species Showdown names differently from the template.
+function getPokemonName(currentmon: string): string {
+	let name = currentmon;
+	if (name.includes('(M)')) name = name.replace(/ \(M\)/g, '');
+	else if (name.includes('(F)')) name = name.replace(/ \(F\)/g, '');
+	if (name.includes('\\r\\n')) name = name.replace(/\\r\\n/g, '');
 
-// Recovers a tera type from text whose `type-…` span is missing.
-function correctTeraType(rawText: string): string {
-	for (const tera of TERA_TYPES) {
-		if (rawText.includes(tera)) {
-			return tera.charAt(0).toUpperCase() + tera.slice(1);
-		}
+	if (name.includes(' @')) name = name.split(' @')[0];
+	else name = name.split(' Ability')[0];
+
+	if (name.includes('(')) name = name.split('(')[1].split(')')[0];
+
+	if (name.includes('Terapagos')) return 'Terapagos';
+	if (name.includes('Zamazenta')) return 'Zamazenta-Crowned';
+	if (name.includes('Zacian')) return 'Zacian-Crowned';
+	if (name.includes('Palafin')) return 'Palafin';
+
+	return name.trim();
+}
+
+function getNickname(currentmon: string): string {
+	let nick = currentmon.split('\\r\\n')[0];
+	nick = nick.replace(/\(M\)/g, '').replace(/\(F\)/g, '');
+	if (!nick.includes('(')) return '';
+	return fixUnicodeChars(nick.split('(')[0].trim());
+}
+
+function getItem(currentmon: string): string {
+	const beforeTera = currentmon.split('Tera: ')[0];
+	if (beforeTera.includes('@ ')) {
+		return beforeTera.split('@ ')[1]?.split('\\r\\n')[0].trim() ?? '';
 	}
-	return rawText;
+	return '';
 }
 
-const MOVE_EXCEPTIONS = [
-	'Matcha Gotcha',
-	'Blood Moon',
-	'Ivy Cudgel',
-	'Syrup Bomb',
-	'Electro Shot',
-	'Thunderclap',
-	'Tachyon Cutter',
-	'Mighty Cleave',
-	'Psyblade',
-	'Hydro Steam',
-	'Supercell Slam',
-	'Burning Bulwark',
-	'Hard Press',
-	'Fickle Beam',
-	'Tera Starstorm',
-	'Dragon Cheer',
-	'Alluring Voice',
-	'Temper Flare',
-	'Psychic Noise',
-	'Upper Hand',
-	'Malignant Chain',
-];
-
-// Pokepaste doesn't wrap a handful of newer moves in a span; re-insert the
-// markup the parser keys off of.
-function patchMoveExceptions(rawText: string): string {
-	let returnText = rawText;
-	for (const move of MOVE_EXCEPTIONS) {
-		returnText = returnText.replace(
-			move,
-			`<span class="type-grass">-</span> ${move}  \n`,
-		);
-	}
-	return returnText;
+function getTera(currentmon: string): string {
+	return currentmon.split('Tera Type: ')[1]?.split('\\r\\n')[0].trim() ?? '';
 }
 
-const MON_EXCEPTIONS = [
-	'Munkidori',
-	'Okidogi',
-	'Fezandipiti',
-	'Dipplin',
-	'-Bloodmoon',
-	'-Hisui',
-	'-Cornerstone',
-	'-Wellspring',
-	'-Hearthflame',
-	'-Artisan',
-	'-Masterpiece',
-	'Overqwil',
-	'Walking Wake',
-	'Iron Leaves',
-	'Archaludon',
-	'Raging Bolt',
-	'Hydrapple',
-	'Gouging Fire',
-	'Iron Boulder',
-	'Iron Crown',
-	'Terapagos',
-	'Pecharunt',
-];
-
-function patchMonExceptions(rawText: string): string {
-	let returnText = rawText;
-	const firstSplit = returnText.split('</span>')[0];
-	for (const mon of MON_EXCEPTIONS) {
-		if (firstSplit.includes(mon)) {
-			returnText = `<span class="type-grass">${returnText.replace(
-				mon,
-				`${mon}</span>`,
-			)}`;
-		}
-	}
-	return returnText;
+function getAbility(currentmon: string): string {
+	return currentmon.split('Ability: ')[1]?.split('\\r\\n')[0].trim() ?? '';
 }
 
-export function teamFromPaste(html: string): string[] {
+function getEvs(currentmon: string): string {
+	return currentmon.split('EVs: ')[1]?.split('\\r\\n')[0].trim() ?? '';
+}
+
+function getMoves(currentmon: string): string[] {
+	const moves = currentmon.split('\\r\\n- ');
+	if (moves[4] !== undefined) moves[4] = moves[4].replace(/\\r\\n/g, '');
+	return moves;
+}
+
+// Input is the text of the pokepaste `/json` response.
+export function teamFromPaste(jsonText: string): string[] {
+	// The `paste` field holds the raw Showdown export; mons are separated by a
+	// blank line (`\r\n\r\n` in the escaped JSON text).
+	const paste = jsonText.split('paste":"')[1]?.split('","title":')[0] ?? '';
+	let monsplit = paste.split('\\r\\n\\r\\n');
+	if (monsplit[0] === '') monsplit = monsplit.slice(1);
+
 	const team: PasteMon[] = [];
-	const teamTitle = html.split('</title>')[0].split('<title>')[1] ?? '';
-	const monSplit = html.split('<pre>');
-
-	for (let monIndex = 1; monIndex < monSplit.length; monIndex++) {
-		let monException = false;
-		let currentMonLine = patchMonExceptions(monSplit[monIndex]);
-		if (currentMonLine !== monSplit[monIndex]) monException = true;
-
-		const beforeSpan = () => currentMonLine.split('</span>')[0];
-		const wrap = (token: string, type: string) => {
-			currentMonLine = `<span class="type-${type}">${currentMonLine.replace(
-				token,
-				`${token}</span>`,
-			)}`;
-			monException = true;
-		};
-
-		if (
-			beforeSpan().includes('Sinistcha') &&
-			!beforeSpan().includes('Sinistcha-')
-		)
-			wrap('Sinistcha', 'grass');
-		if (
-			beforeSpan().includes('Poltchageist') &&
-			!beforeSpan().includes('Poltchageist-')
-		)
-			wrap('Poltchageist', 'grass');
-		if (beforeSpan().includes('Alcremie-') && beforeSpan().includes('-Cream'))
-			wrap('Cream', 'fairy');
-		if (beforeSpan().includes('Alcremie-') && beforeSpan().includes('-Swirl'))
-			wrap('Swirl', 'fairy');
-		if (beforeSpan().includes('Ogerpon') && !beforeSpan().includes('Ogerpon-'))
-			wrap('Ogerpon', 'grass');
-
-		const monHeader = currentMonLine.split('</span>')[0];
-		let tempName = monHeader.split('>')[1];
-		let tempNick =
-			currentMonLine.charAt(0) === '<'
-				? monHeader.split('>')[1]
-				: monHeader.split(' (<span')[0];
-
-		if (monException) {
-			const garbo = tempName;
-			if (garbo.includes(' (')) {
-				tempName = garbo.split(' (')[1];
-				tempNick = garbo.split(' (')[0];
-			}
-		}
-		tempNick = fixSpecialChars(tempNick);
-
-		// Tera type — handle both the well-formed span and the broken variant.
-		const teraCorrectionInfo = currentMonLine.split(
-			'<span class="attr">Tera Type: </span>',
-		)[1];
-		let teraType: string;
-		if (teraCorrectionInfo === undefined) {
-			// Some pastes omit a Tera Type entirely.
-			teraType = '';
-		} else if (teraCorrectionInfo.charAt(0) === '<') {
-			const teraSplitInfo = currentMonLine.split(
-				'<span class="attr">Tera Type: </span><span class="type-',
-			);
-			teraType = teraSplitInfo[1].split('>')[1].split('<')[0];
-		} else {
-			teraType = correctTeraType(teraCorrectionInfo.split('<')[0]);
-		}
-
-		const moveFixText = patchMoveExceptions(currentMonLine);
-		const moveSplits = moveFixText.split('">-</span> ');
-		const moveAt = (i: number): string =>
-			i in moveSplits ? moveSplits[i].split('\n')[0] : '';
-		let m1 = moveAt(1);
-		let m2 = moveAt(2);
-		let m3 = moveAt(3);
-		let m4 = moveAt(4);
-
-		const fixSignatureMove = (replacement: string) => {
-			if (m1.includes('Iron Head')) m1 = replacement;
-			if (m2.includes('Iron Head')) m2 = replacement;
-			if (m3.includes('Iron Head')) m3 = replacement;
-			if (m4.includes('Iron Head')) m4 = replacement;
-		};
-		if (tempName === 'Zacian-Crowned') fixSignatureMove('Behemoth Blade');
-		if (tempName === 'Zamazenta-Crowned') fixSignatureMove('Behemoth Bash');
-
+	for (const currentmon of monsplit) {
+		if (!currentmon.trim()) continue;
+		const moves = getMoves(currentmon);
 		team.push({
-			name: tempName,
-			nickname: tempNick,
-			tera: teraType,
-			moves: [m1, m2, m3, m4],
+			name: getPokemonName(currentmon),
+			nickname: getNickname(currentmon),
+			item: getItem(currentmon),
+			ability: getAbility(currentmon),
+			tera: getTera(currentmon),
+			moves: [moves[1] ?? '', moves[2] ?? '', moves[3] ?? '', moves[4] ?? ''],
+			evs: getEvs(currentmon),
 		});
 	}
 
+	// Mirrors outputTeam: 10 values per mon (up to 6), down column A.
 	const output: string[] = [];
-	const teras: string[] = [];
-	for (const mon of team) {
+	for (const mon of team.slice(0, 6)) {
+		output.push(mon.nickname === '' ? mon.name : mon.nickname);
 		output.push(mon.name);
-		teras.push(mon.tera);
+		output.push(mon.item);
+		output.push(mon.ability);
+		output.push(mon.tera);
 		output.push(mon.moves[0], mon.moves[1], mon.moves[2], mon.moves[3]);
+		output.push(mon.evs);
 	}
-	for (const tera of teras) output.push(tera);
-	for (const mon of team) output.push(mon.nickname);
-	output.push(teamTitle);
 	return output;
 }

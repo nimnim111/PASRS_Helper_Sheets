@@ -33,23 +33,24 @@ const SPREADSHEET_STORAGE_KEY = 'pasrs_sheets_spreadsheet_id';
 // Spreadsheets whose custom-function cells we've already neutralised.
 const PREPARED_STORAGE_KEY = 'pasrs_sheets_prepared';
 
-// PASRS HomePage layout: replay links go in C14:C113, the Showdown name in G6,
-// the team pokepaste URL in G8.
-const HOMEPAGE = 'HomePage';
-const REPLAY_RANGE = 'C14:C113';
-const REPLAY_FIRST_ROW = 14;
+// PASRS 7 layout: name/paste go on the "Home" sheet; replay links go in the
+// "Replay Entries" sheet starting at C7. Helper formulas on Base Data begin at
+// column DA, so we write at most up to CZ to avoid overwriting them.
+const HOMEPAGE = 'Home';
+const REPLAY_ENTRIES = 'Replay Entries';
+const REPLAY_RANGE = 'C7:C106';
+const REPLAY_FIRST_ROW = 7;
 const REPLAY_MAX = 100;
 const NAME_CELL = 'G6';
 const PASTE_CELL = 'G8';
 
 // `Base Data` holds one "spill" row per game (REPLAYTODATA's output) that every
-// downstream formula reads. Row 3 pairs with HomePage replay-link row 14, and so
-// on. The spill occupies columns B..CT; helper formulas live in CU onward and
-// must not be overwritten, so each game row is written across exactly B..CT.
+// downstream formula reads. Row 3 pairs with Replay Entries row 7, and so on.
+// Helper formulas start at column DA; write at most B..CZ to stay clear.
 const BASE_DATA = 'Base Data';
 const BASE_DATA_FIRST_ROW = 3;
-const BASE_DATA_LAST_SPILL_COL = 'CT';
-const BASE_DATA_SPILL_WIDTH = 97; // columns B..CT inclusive
+const BASE_DATA_LAST_SPILL_COL = 'CZ';
+const BASE_DATA_SPILL_WIDTH = 103; // columns B..CZ inclusive (CZ=col104, B=col2 → 103 cols)
 
 // `Team Info From Paste` holds the player's team (TEAMDATAFROMPASTE's output)
 // down column A, starting A1.
@@ -314,10 +315,15 @@ async function createFromTemplate(tokenRef: TokenRef): Promise<string> {
 
 // Drive files.get to detect a trashed file. Returns false if Drive can't tell
 // us (e.g. a sheet the app didn't create), so we never discard a usable sheet.
-async function isTrashed(tokenRef: TokenRef, id: string): Promise<boolean> {
+// Use Drive API (drive.file scope) to check existence + trash status.
+// The Sheets API requires the spreadsheets scope which we no longer request.
+async function isUsableSpreadsheet(
+	tokenRef: TokenRef,
+	id: string,
+): Promise<boolean> {
 	const url = `https://www.googleapis.com/drive/v3/files/${id}?fields=trashed`;
 	const doFetch = (token: string) =>
-		fetchWithRetry('drive get', () =>
+		fetchWithRetry('drive check', () =>
 			fetch(url, { headers: { Authorization: `Bearer ${token}` } }),
 		);
 	let response = await doFetch(tokenRef.token);
@@ -331,23 +337,7 @@ async function isTrashed(tokenRef: TokenRef, id: string): Promise<boolean> {
 	}
 	if (!response.ok) return false;
 	const json = (await response.json()) as { trashed?: boolean };
-	return json.trashed === true;
-}
-
-// A spreadsheet is usable if the Sheets API can reach it (not deleted / no
-// access) and it isn't in the trash.
-async function isUsableSpreadsheet(
-	tokenRef: TokenRef,
-	id: string,
-): Promise<boolean> {
-	const response = await sheetsCall(
-		tokenRef,
-		`${id}?fields=spreadsheetId`,
-		'GET',
-	);
-	if (response.status === 404 || response.status === 403) return false;
-	if (!response.ok) return true; // transient error — don't throw away the sheet
-	return !(await isTrashed(tokenRef, id));
+	return json.trashed !== true;
 }
 
 // Use the provided id (or stored one) if it's still usable; otherwise auto-create
@@ -462,10 +452,9 @@ async function ensurePrepared(
 			{
 				ranges: [
 					`'${BASE_DATA}'!B${BASE_DATA_FIRST_ROW}:${BASE_DATA_LAST_SPILL_COL}102`,
-					`'${TEAM_INFO}'!A1:A100`,
-					// Also reset the HomePage inputs so a sheet created from the
-					// bundled template doesn't start with the template's sample data.
-					`'${HOMEPAGE}'!${REPLAY_RANGE}`,
+					`'${TEAM_INFO}'!A1:A60`,
+					// Reset the sample data that ships with the bundled template.
+					`'${REPLAY_ENTRIES}'!${REPLAY_RANGE}`,
 					`'${HOMEPAGE}'!${NAME_CELL}`,
 					`'${HOMEPAGE}'!${PASTE_CELL}`,
 				],
@@ -488,9 +477,12 @@ async function fetchReplayJson(url: string): Promise<string> {
 	return response.text();
 }
 
-// Fetch a pokepaste HTML page (covered by the pokepast.es host permission).
-async function fetchPasteHtml(url: string): Promise<string> {
-	const response = await fetchWithRetry('pokepaste', () => fetch(url));
+// Fetch a pokepaste's JSON (the `/json` endpoint holds the raw Showdown paste
+// text, exactly what the importteam Apps Script parses). Covered by the
+// pokepast.es host permission.
+async function fetchPasteJson(url: string): Promise<string> {
+	const jsonUrl = `${url.replace(/\/+$/, '')}/json`;
+	const response = await fetchWithRetry('pokepaste', () => fetch(jsonUrl));
 	if (!response.ok) {
 		throw new Error(`Could not fetch pokepaste (${response.status})`);
 	}
@@ -543,17 +535,20 @@ async function handleLog(data?: SheetsRequestData): Promise<SheetsResponse> {
 	const tokenRef: TokenRef = { token: initialToken };
 
 	try {
-		const spreadsheetId = await resolveSpreadsheetId(tokenRef, provided);
-		const titles = await getSheetTitles(tokenRef, spreadsheetId);
-		if (!titles.has(HOMEPAGE) || !titles.has(BASE_DATA)) {
-			return {
-				ok: false,
-				error:
-					"That spreadsheet isn't a PASRS tracker (no 'HomePage' / 'Base Data').",
-			};
+		let spreadsheetId = await resolveSpreadsheetId(tokenRef, provided);
+		let titles = await getSheetTitles(tokenRef, spreadsheetId);
+		if (!titles.has(REPLAY_ENTRIES) || !titles.has(BASE_DATA)) {
+			// Wrong template version (e.g. old PASRS 4.3 tracker) — create a fresh one.
+			spreadsheetId = await createFromTemplate(tokenRef);
+			titles = await getSheetTitles(tokenRef, spreadsheetId);
+			if (!titles.has(REPLAY_ENTRIES) || !titles.has(BASE_DATA)) {
+				return {
+					ok: false,
+					error: 'Created a new tracker but it is missing required sheets.',
+				};
+			}
 		}
-		// Remember whatever we actually resolved (the provided id, or a freshly
-		// created one if the old sheet was missing/trashed).
+		// Remember whatever we actually resolved.
 		await setStoredSpreadsheetId(spreadsheetId);
 		await ensurePrepared(tokenRef, spreadsheetId);
 
@@ -561,7 +556,7 @@ async function handleLog(data?: SheetsRequestData): Promise<SheetsResponse> {
 		const existing = await readValues(
 			tokenRef,
 			spreadsheetId,
-			HOMEPAGE,
+			REPLAY_ENTRIES,
 			REPLAY_RANGE,
 		);
 		const links = existing.map((row) => (row[0] ?? '').trim());
@@ -579,7 +574,7 @@ async function handleLog(data?: SheetsRequestData): Promise<SheetsResponse> {
 
 		// Parse the replay and write its data row first, so the dashboards never
 		// see a replay link without its computed data. Row N in Base Data pairs
-		// with replay-link row N on the HomePage.
+		// with replay-link row N in Replay Entries.
 		const jsonText = await fetchReplayJson(url);
 		const dataRow = padTo(replayToData(url, jsonText), BASE_DATA_SPILL_WIDTH);
 		const baseRow = BASE_DATA_FIRST_ROW + filled;
@@ -594,7 +589,7 @@ async function handleLog(data?: SheetsRequestData): Promise<SheetsResponse> {
 		await writeCell(
 			tokenRef,
 			spreadsheetId,
-			HOMEPAGE,
+			REPLAY_ENTRIES,
 			`C${REPLAY_FIRST_ROW + filled}`,
 			url,
 		);
@@ -646,16 +641,16 @@ async function handleTeam(data?: SheetsRequestData): Promise<SheetsResponse> {
 	const tokenRef: TokenRef = { token: initialToken };
 
 	try {
-		const spreadsheetId = await resolveSpreadsheetId(tokenRef, provided);
-		const titles = await getSheetTitles(tokenRef, spreadsheetId);
+		let spreadsheetId = await resolveSpreadsheetId(tokenRef, provided);
+		let titles = await getSheetTitles(tokenRef, spreadsheetId);
 		if (!titles.has(TEAM_INFO)) {
-			return {
-				ok: false,
-				error: "That spreadsheet isn't a PASRS tracker.",
-			};
+			spreadsheetId = await createFromTemplate(tokenRef);
+			titles = await getSheetTitles(tokenRef, spreadsheetId);
+			if (!titles.has(TEAM_INFO)) {
+				return { ok: false, error: "Created a new tracker but it is missing 'Team Info From Paste'." };
+			}
 		}
-		// Remember whatever we actually resolved (the provided id, or a freshly
-		// created one if the old sheet was missing/trashed).
+		// Remember whatever we actually resolved.
 		await setStoredSpreadsheetId(spreadsheetId);
 		await ensurePrepared(tokenRef, spreadsheetId);
 
@@ -663,8 +658,8 @@ async function handleTeam(data?: SheetsRequestData): Promise<SheetsResponse> {
 		if (teamData && teamData.length > 0) {
 			team = teamData;
 		} else {
-			const html = await fetchPasteHtml(pasteUrl as string);
-			team = teamFromPaste(html);
+			const json = await fetchPasteJson(pasteUrl as string);
+			team = teamFromPaste(json);
 		}
 		if (team.length === 0) {
 			return { ok: false, error: 'No Pokémon found in that team' };

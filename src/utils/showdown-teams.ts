@@ -9,6 +9,9 @@ interface ShowdownSet {
 	species?: string;
 	moves?: string[];
 	teraType?: string;
+	item?: string;
+	ability?: string;
+	evs?: { hp?: number; atk?: number; def?: number; spa?: number; spd?: number; spe?: number };
 }
 
 interface ShowdownStorageLike {
@@ -23,6 +26,8 @@ interface ShowdownStorageLike {
 interface DexLike {
 	moves?: { get?: (x: string) => { name?: string } | undefined };
 	species?: { get?: (x: string) => { name?: string } | undefined };
+	items?: { get?: (x: string) => { name?: string } | undefined };
+	abilities?: { get?: (x: string) => { name?: string } | undefined };
 }
 
 export interface ShowdownTeam {
@@ -57,9 +62,8 @@ export function getShowdownTeams(): ShowdownTeam[] {
 	});
 }
 
-// Build the `Team Info From Paste` column (written down column A), matching the
-// order TEAMDATAFROMPASTE produced: per mon [species, m1, m2, m3, m4], then all
-// tera types, then all nicknames, then the team title.
+// PASRS 7 importteam format: per mon [nick/name, name, item, ability, tera,
+// move1, move2, move3, move4, evs] — 10 items × up to 6 mons written to col A.
 export function buildTeamInfoColumn(
 	teamName: string,
 	sets: ShowdownSet[],
@@ -69,29 +73,41 @@ export function buildTeamInfoColumn(
 		(move && dex?.moves?.get?.(move)?.name) || move;
 	const speciesName = (species: string): string =>
 		(species && dex?.species?.get?.(species)?.name) || species;
+	const itemName = (item: string): string =>
+		(item && dex?.items?.get?.(item)?.name) || item;
+	const abilityName = (ability: string): string =>
+		(ability && dex?.abilities?.get?.(ability)?.name) || ability;
+
+	const formatEvs = (evs?: ShowdownSet['evs']): string => {
+		if (!evs) return '';
+		const parts: string[] = [];
+		if (evs.hp) parts.push(`${evs.hp} HP`);
+		if (evs.atk) parts.push(`${evs.atk} Atk`);
+		if (evs.def) parts.push(`${evs.def} Def`);
+		if (evs.spa) parts.push(`${evs.spa} SpA`);
+		if (evs.spd) parts.push(`${evs.spd} SpD`);
+		if (evs.spe) parts.push(`${evs.spe} Spe`);
+		return parts.join(' / ');
+	};
 
 	const out: string[] = [];
-	const teras: string[] = [];
-	const nicks: string[] = [];
-
 	for (const set of sets) {
 		const species = speciesName(set.species || set.name || '');
-		out.push(species);
+		const nick = set.name && set.name !== set.species ? set.name : species;
 		const moves = set.moves ?? [];
+		out.push(nick);
+		out.push(species);
+		out.push(itemName(set.item ?? ''));
+		out.push(abilityName(set.ability ?? ''));
+		out.push(set.teraType ?? '');
 		out.push(
 			moveName(moves[0] ?? ''),
 			moveName(moves[1] ?? ''),
 			moveName(moves[2] ?? ''),
 			moveName(moves[3] ?? ''),
 		);
-		teras.push(set.teraType ?? '');
-		// In-battle nickname (what appears in replays); falls back to species.
-		const nick = set.name && set.name !== set.species ? set.name : species;
-		nicks.push(nick);
+		out.push(formatEvs(set.evs));
 	}
-
-	for (const tera of teras) out.push(tera);
-	for (const nick of nicks) out.push(nick);
-	out.push(teamName);
+	void teamName; // team title not used in PASRS 7 column A
 	return out;
 }
