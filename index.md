@@ -13,6 +13,7 @@ own Google Sheet. There is no third-party server.
 
 - **Source code:** <https://github.com/nimnim111/Pasrs-Helper-Sheets>
 - **Privacy policy:** [PRIVACY](PRIVACY)
+- **Terms of service:** [TERMS](TERMS)
 
 ## What it does
 
