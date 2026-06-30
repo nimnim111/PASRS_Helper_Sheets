@@ -1,3 +1,7 @@
+---
+title: PASRS Helper — Privacy Policy
+---
+
 # PASRS Helper — Privacy Policy
 
 _Last updated: 2026-06-29_
