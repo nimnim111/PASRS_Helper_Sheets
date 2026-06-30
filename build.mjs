@@ -1,6 +1,7 @@
 import { execSync } from 'node:child_process';
 import {
 	copyFileSync,
+	cpSync,
 	readFileSync,
 	readdirSync,
 	writeFileSync,
@@ -13,7 +14,7 @@ const outputDir = resolve(__dirname, 'output');
 const distDir = resolve(outputDir, 'dist');
 const manifestPath = resolve(__dirname, 'manifest.base.json');
 const packageJsonPath = resolve(__dirname, 'package.json');
-const iconPath = resolve(__dirname, '128.png');
+const iconsDir = resolve(__dirname, 'icons');
 const templatePath = resolve(__dirname, 'pasrs-template.xlsx');
 
 const FIREFOX_ID =
@@ -144,7 +145,7 @@ function build(target = 'chrome') {
 	const { version } = JSON.parse(readFileSync(packageJsonPath, 'utf-8'));
 	manifest.version = version;
 
-	copyFileSync(iconPath, resolve(outputDir, '128.png'));
+	cpSync(iconsDir, resolve(outputDir, 'icons'), { recursive: true });
 	// The PASRS sheet template the extension uploads (via Drive) to auto-create a
 	// tracker. Fetched at runtime through chrome.runtime.getURL.
 	copyFileSync(templatePath, resolve(outputDir, 'pasrs-template.xlsx'));

@@ -14,7 +14,10 @@
 		"react:dev": "rsbuild dev --open",
 		"format": "biome format --write",
 		"preview": "rsbuild preview",
-		"release": "bun release.mjs"
+		"release": "bun release.mjs",
+		"source:zip": "git archive --format=zip -o source.zip HEAD",
+		"sign:firefox": "npm run build:firefox && web-ext sign --source-dir output --channel=unlisted",
+		"sign:firefox-listed": "npm run build:firefox && npm run source:zip && web-ext sign --source-dir output --channel=listed --upload-source-code source.zip"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^1.9.4",
