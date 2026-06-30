@@ -67,7 +67,8 @@ function getOAuthConfig(): { clientId: string; scopes: string[] } {
 	).oauth2;
 	return {
 		clientId: oauth2?.client_id ?? '',
-		scopes: oauth2?.scopes ?? ['https://www.googleapis.com/auth/spreadsheets'],
+		// Updated to use non-sensitive drive.file scope so custom domains are not required
+		scopes: oauth2?.scopes ?? ['https://www.googleapis.com/auth/drive.file'],
 	};
 }
 

@@ -1,7 +1,7 @@
 {
 	"name": "PASRS Helper",
 	"description": "Auto-saves your Pokémon Showdown replays and fills a PASRS Google Sheet with your stats — picks, leads, tera, Elo and matchups.",
-	"version": "1.1.0",
+	"version": "1.1.2",
 	"manifest_version": 3,
 	"icons": {
 		"16": "icons/icon-16.png",
@@ -20,10 +20,7 @@
 	],
 	"oauth2": {
 		"client_id": "399755851205-l7i2g4jrqbgv9a8lsrqe8drbo1lqdg19.apps.googleusercontent.com",
-		"scopes": [
-			"https://www.googleapis.com/auth/spreadsheets",
-			"https://www.googleapis.com/auth/drive.file"
-		]
+		"scopes": ["https://www.googleapis.com/auth/drive.file"]
 	},
 	"background": {
 		"service_worker": "dist/background.js"
@@ -36,10 +33,7 @@
 	],
 	"web_accessible_resources": [
 		{
-			"resources": [
-				"dist/*.js",
-				"dist/*.css"
-			],
+			"resources": ["dist/*.js", "dist/*.css"],
 			"matches": ["*://play.pokemonshowdown.com/*", "*://*.psim.us/*"]
 		}
 	]
