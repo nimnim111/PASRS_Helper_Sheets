@@ -16,19 +16,28 @@ export type SheetsAction =
 	| 'signout'
 	| 'status'
 	| 'log'
+	| 'team'
+	| 'create'
 	| 'spreadsheet';
 
-// The replay to add to the PASRS HomePage. The template's Apps Script parses
-// everything else from the replay itself.
+// A recorded replay to log. The extension fetches the replay, parses it, and
+// writes the result into the PASRS template's `Base Data` sheet (reproducing the
+// template's own `REPLAYTODATA` so its formula-driven dashboards render).
 export interface SheetsLogPayload {
 	url: string;
-	playerName: string; // Showdown username, set in HomePage Step 2 if empty
+	playerName: string; // Showdown username, set in HomePage G6 if empty
 }
 
 export interface SheetsRequestData {
 	spreadsheetId?: string;
 	sheetName?: string;
 	payload?: SheetsLogPayload;
+	// For the 'team' action, one of:
+	//  - teamData: the already-built `Team Info From Paste` column (from a chosen
+	//    Showdown team — preferred, no HTML parsing), or
+	//  - teamPasteUrl: a pokepaste URL the background fetches + parses.
+	teamData?: string[];
+	teamPasteUrl?: string;
 }
 
 export interface SheetsRequestMessage {
@@ -79,7 +88,13 @@ export const sheetsRequest = (
 				return;
 			}
 			cleanup();
-			resolve({ ok: data.ok, error: data.error, signedIn: data.signedIn });
+			resolve({
+				ok: data.ok,
+				error: data.error,
+				signedIn: data.signedIn,
+				spreadsheetId: data.spreadsheetId,
+				spreadsheetUrl: data.spreadsheetUrl,
+			});
 		};
 
 		const timer = setTimeout(() => {

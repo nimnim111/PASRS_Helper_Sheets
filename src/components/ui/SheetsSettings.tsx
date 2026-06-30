@@ -2,6 +2,11 @@ import { useCallback, useEffect, useState } from 'react';
 import styled from 'styled-components';
 import { sheetsRequest } from '../../lib/events';
 import type { SettingsKey } from '../../types/settings';
+import {
+	type ShowdownTeam,
+	buildTeamInfoColumn,
+	getShowdownTeams,
+} from '../../utils/showdown-teams';
 import { SettingsCheckbox } from './SettingsCheckBox';
 import { SettingsTextInput } from './SettingsTextInput';
 
@@ -60,9 +65,26 @@ const GuideLink = styled.a`
 	cursor: pointer;
 `;
 
+const TeamSelect = styled.select`
+	flex: 1;
+	margin: 2px 13px;
+	padding: 3px 6px;
+	border: 1px solid #ccc;
+	border-radius: 4px;
+	font-size: 12px;
+	background: transparent;
+	color: inherit;
+
+	&:disabled {
+		cursor: not-allowed;
+		opacity: 0.6;
+	}
+`;
+
 interface SheetsSettingsProps {
 	logToSheets: boolean;
 	spreadsheetId: string;
+	teamPasteUrl: string;
 	onCheckboxChange: (key: SettingsKey, value: boolean) => void;
 	onTextChange: (key: SettingsKey, value: string) => void;
 }
@@ -70,6 +92,7 @@ interface SheetsSettingsProps {
 export function SheetsSettings({
 	logToSheets,
 	spreadsheetId,
+	teamPasteUrl,
 	onCheckboxChange,
 	onTextChange,
 }: SheetsSettingsProps) {
@@ -77,6 +100,15 @@ export function SheetsSettings({
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState('');
 	const [sheetUrl, setSheetUrl] = useState('');
+	const [teamBusy, setTeamBusy] = useState(false);
+	const [teamStatus, setTeamStatus] = useState('');
+	const [creating, setCreating] = useState(false);
+	const [teams, setTeams] = useState<ShowdownTeam[]>([]);
+	const [selectedTeam, setSelectedTeam] = useState(0);
+
+	useEffect(() => {
+		setTeams(getShowdownTeams());
+	}, []);
 
 	const refreshSheet = useCallback(() => {
 		sheetsRequest('spreadsheet', { spreadsheetId }).then((res) => {
@@ -115,6 +147,48 @@ export function SheetsSettings({
 		setSignedIn(false);
 	};
 
+	const handleCreate = async (): Promise<void> => {
+		setCreating(true);
+		setError('');
+		const res = await sheetsRequest('create', undefined, 120000);
+		setCreating(false);
+		if (res.ok && res.spreadsheetId) {
+			onTextChange('sheets_spreadsheet_id', res.spreadsheetId);
+			setSheetUrl(res.spreadsheetUrl ?? '');
+		} else {
+			setError(res.error || 'Could not create tracker');
+		}
+	};
+
+	const handleUseTeam = async (): Promise<void> => {
+		const team = teams[selectedTeam];
+		if (!team) return;
+		setTeamBusy(true);
+		setTeamStatus('');
+		setError('');
+		const teamData = buildTeamInfoColumn(team.name, team.sets);
+		const res = await sheetsRequest('team', { spreadsheetId, teamData });
+		setTeamBusy(false);
+		if (res.ok) {
+			setTeamStatus('Team updated');
+		} else {
+			setError(res.error || 'Could not update team');
+		}
+	};
+
+	const handleSyncTeam = async (): Promise<void> => {
+		setTeamBusy(true);
+		setTeamStatus('');
+		setError('');
+		const res = await sheetsRequest('team', { spreadsheetId, teamPasteUrl });
+		setTeamBusy(false);
+		if (res.ok) {
+			setTeamStatus('Team updated');
+		} else {
+			setError(res.error || 'Could not update team');
+		}
+	};
+
 	return (
 		<>
 			<SettingsCheckbox
@@ -146,24 +220,91 @@ export function SheetsSettings({
 			<SettingsTextInput
 				settingsKey="sheets_spreadsheet_id"
 				value={spreadsheetId}
-				placeholder="PASRS spreadsheet ID"
+				placeholder="PASRS spreadsheet ID (or create one →)"
 				onChange={onTextChange}
 				disabled={!logToSheets}
 			/>
 
+			<AuthRow>
+				<AuthButton
+					type="button"
+					onClick={handleCreate}
+					disabled={creating || !logToSheets || !signedIn}
+				>
+					{creating ? 'Creating…' : 'Create tracker'}
+				</AuthButton>
+				<StatusText $signedIn={false}>
+					Makes a new PASRS sheet in your Drive
+				</StatusText>
+			</AuthRow>
+
 			<HintText>
 				{sheetUrl ? (
 					<>
-						Adding replays to your{' '}
+						Filling in your{' '}
 						<a href={sheetUrl} target="_blank" rel="noopener noreferrer">
 							PASRS tracker
-						</a>
-						.
+						</a>{' '}
+						from each recorded replay.
 					</>
 				) : (
-					'Make a copy of the PASRS sheet (File → Make a copy) and paste its spreadsheet ID from the URL.'
+					'Click "Create tracker" to make a PASRS sheet automatically, or paste an existing spreadsheet ID.'
 				)}
 			</HintText>
+
+			<HintText>Set your team (fills the Usage Stats page):</HintText>
+
+			{teams.length > 0 ? (
+				<>
+					<TeamSelect
+						value={selectedTeam}
+						disabled={!logToSheets || teamBusy}
+						onChange={(e) => setSelectedTeam(Number(e.target.value))}
+					>
+						{teams.map((team, index) => (
+							<option key={`${team.name}-${index}`} value={index}>
+								{team.name}
+								{team.format ? ` (${team.format})` : ''}
+							</option>
+						))}
+					</TeamSelect>
+
+					<AuthRow>
+						<AuthButton
+							type="button"
+							onClick={handleUseTeam}
+							disabled={teamBusy || !logToSheets || !signedIn}
+						>
+							Use selected team
+						</AuthButton>
+						{teamStatus && (
+							<StatusText $signedIn={true}>{teamStatus}</StatusText>
+						)}
+					</AuthRow>
+				</>
+			) : (
+				<>
+					<SettingsTextInput
+						settingsKey="sheets_team_paste_url"
+						value={teamPasteUrl}
+						placeholder="Your team pokepaste URL (pokepast.es/…)"
+						onChange={onTextChange}
+						disabled={!logToSheets}
+					/>
+					<AuthRow>
+						<AuthButton
+							type="button"
+							onClick={handleSyncTeam}
+							disabled={teamBusy || !logToSheets || !signedIn || !teamPasteUrl}
+						>
+							Update team in sheet
+						</AuthButton>
+						{teamStatus && (
+							<StatusText $signedIn={true}>{teamStatus}</StatusText>
+						)}
+					</AuthRow>
+				</>
+			)}
 
 			{error && <ErrorText>{error}</ErrorText>}
 

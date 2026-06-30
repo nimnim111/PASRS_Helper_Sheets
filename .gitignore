@@ -8,6 +8,10 @@
 node_modules
 output/
 build/
+web-ext-artifacts/
+
+# Tooling
+.serena/
 
 # IDE
 .vscode/*

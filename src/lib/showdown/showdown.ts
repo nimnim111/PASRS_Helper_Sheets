@@ -31,6 +31,18 @@ const replaysManager = new ReplaysManager();
 
 let currentSettings = settingsManager.getSettings();
 
+// Best-effort desktop notification (used to surface Google Sheets sync results
+// so a failed/misrouted write isn't silent).
+function notify(message: string): void {
+	try {
+		if (typeof Notification !== 'undefined') {
+			new Notification(message);
+		}
+	} catch {
+		// Notifications may be unavailable/denied; ignore.
+	}
+}
+
 onSettingsUpdated((settings) => {
 	currentSettings = settings;
 });
@@ -109,11 +121,23 @@ app.receive = (data: string) => {
 						spreadsheetId: settings.sheets_spreadsheet_id,
 						payload: { url, playerName: getUserFromCookies() ?? '' },
 					}).then((response) => {
-						if (!response.ok) {
+						if (response.ok) {
+							if (settings.notifications) {
+								notify('Game added to your PASRS tracker');
+							}
+						} else {
 							console.error(
 								'PASRS Helper: failed to log replay to Google Sheets',
 								response.error,
 							);
+							// Always surface a sheet failure — otherwise it's silent and
+							// the tracker just looks like it isn't updating.
+							const message = (response.error ?? '').includes(
+								'context invalidated',
+							)
+								? 'PASRS: reload the Showdown page to reconnect (extension was updated).'
+								: `PASRS: couldn't update sheet — ${response.error}`;
+							notify(message);
 						}
 					});
 				}

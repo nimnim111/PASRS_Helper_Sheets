@@ -9,6 +9,7 @@ export interface Settings {
 	log_to_sheets: boolean;
 	sheets_spreadsheet_id: string;
 	sheets_sheet_name: string;
+	sheets_team_paste_url: string;
 }
 
 export type SettingsKey = keyof Settings;

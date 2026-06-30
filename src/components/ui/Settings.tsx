@@ -140,6 +140,7 @@ export function Settings() {
 				<SheetsSettings
 					logToSheets={settings.log_to_sheets}
 					spreadsheetId={settings.sheets_spreadsheet_id}
+					teamPasteUrl={settings.sheets_team_paste_url}
 					onCheckboxChange={handleCheckboxChange}
 					onTextChange={handleTextChange}
 				/>

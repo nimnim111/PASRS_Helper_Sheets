@@ -12,18 +12,37 @@ Please follow the guidelines below to ensure a smooth contribution process.
 
 
 ## Google Sheets Integration
-PASRS Helper adds every recorded replay to your **PASRS 4.3** tracker using OAuth
-and the official Google Sheets API. Users sign in with their Google account from
-the settings panel; data goes directly from the extension to Google's API (no
-third party in between).
+PASRS Helper fills in your **PASRS 4.3** tracker for every recorded replay using
+OAuth and the official Google Sheets API. Users sign in with their Google account
+from the settings panel; data goes directly from the extension to Google's API
+(no third party in between).
 
-The PASRS template is driven by its own bound Apps Script functions
-(`REPLAYTODATA`, `TEAMDATAFROMPASTE`) that parse replay links and your team. So
-the extension simply **appends each replay URL to the HomePage replay-link list**
-(`HomePage!C14:C113`) and sets your Showdown name (`HomePage!G6`) if it's empty;
-the template's script then computes every dashboard. (This is why a real copy of
-the sheet is required — "File → Make a copy" keeps the script; an xlsx export
-does not.)
+The PASRS template's dashboards (Game By Game, Usage Stats, Matchup Stats, Lead
+Combos, Move Usage, …) are all driven by **plain spreadsheet formulas**. Those
+formulas read from two source areas that are normally produced by the template's
+bound Apps Script functions:
+
+- `=REPLAYTODATA(replayURL)` → one row per game in the `Base Data` sheet.
+- `=TEAMDATAFROMPASTE(pasteURL)` → your team down column A of `Team Info From Paste`.
+
+When the sheet is exported as xlsx (so it can be imported without the bound
+script), those two custom functions become `#NAME?` — but every other formula
+survives. So the extension **reproduces those two functions itself** and writes
+their output straight into the source areas; the template's formulas then render
+every dashboard identically, no Apps Script required.
+
+- `src/lib/sheets/replay-to-data.ts` — faithful port of `REPLAYTODATA`. The
+  background fetches `<replay>.json`, parses the battle, and writes the resulting
+  spill row to `Base Data!B<row>:CT<row>` (helper columns from `CU` on are left
+  untouched). Game row N pairs with replay-link row N on the HomePage.
+- `src/lib/sheets/team-from-paste.ts` — faithful port of `TEAMDATAFROMPASTE`. The
+  background fetches the pokepaste HTML and writes the team down `Team Info From
+  Paste!A`.
+
+The first time the extension touches a spreadsheet it clears the `#NAME?`
+custom-function cells (`Base Data!B3:CT102`, `Team Info From Paste!A1:A100`) so
+unfilled rows render blank instead of poisoning the dashboards. This is
+data-safe — it only clears when `Base Data!B3` is empty or an error.
 
 ### How it's wired (for contributors)
 The page-injected scripts cannot use `chrome.*`, and OAuth can only run in a
@@ -38,8 +57,16 @@ page (React panel / showdown hook)
 
 - `src/lib/events.ts` — the page<->content RPC (`sheetsRequest` / `onSheetsRequest`).
 - `src/lib/showdown/showdown.ts` — on a recorded replay, sends the replay URL + your Showdown name.
-- `src/background/index.ts` — OAuth + Sheets API calls (`auth`, `status`, `signout`, `log`); appends the URL to HomePage.
-- `src/components/ui/SheetsSettings.tsx` — sign-in UI + spreadsheet ID.
+- `src/background/index.ts` — OAuth + Sheets/Drive API. Handles `auth`, `status`,
+  `signout`, `log` (parse a replay → `Base Data`), `team` (parse a pokepaste →
+  `Team Info From Paste`) and `create` (Drive-upload the bundled template).
+- `src/components/ui/SheetsSettings.tsx` — sign-in UI, spreadsheet ID, "Create
+  tracker" button, team pokepaste URL + "Update team in sheet" button.
+
+The tracker is auto-created by uploading the bundled `pasrs-template.xlsx` to
+Drive and converting it to a Google Sheet (`files.create`, multipart). This only
+needs the `drive.file` scope (the extension is creating the file). If no
+spreadsheet ID is set when a replay is recorded, one is created automatically.
 
 Auth uses `chrome.identity.launchWebAuthFlow` (the OAuth popup) on **every**
 browser — Chrome, Chromium forks (Brave, Edge, …) and Firefox. We deliberately
@@ -52,9 +79,11 @@ The extension ships with a placeholder `client_id` in `manifest.base.json`. To
 make sign-in work you must create your own OAuth client:
 
 1. In the [Google Cloud Console](https://console.cloud.google.com), create a
-   project and **enable the Google Sheets API** (APIs & Services → Library).
-2. Configure the **OAuth consent screen** (External). Add the scope
-   `https://www.googleapis.com/auth/spreadsheets`. While unverified, add yourself
+   project and **enable the Google Sheets API and the Google Drive API**
+   (APIs & Services → Library).
+2. Configure the **OAuth consent screen** (External). Add the scopes
+   `https://www.googleapis.com/auth/spreadsheets` and
+   `https://www.googleapis.com/auth/drive.file`. While unverified, add yourself
    under **Test users**.
 3. Create an **OAuth client ID** of type **Web application** (the same single
    client works for all browsers).
@@ -76,22 +105,17 @@ make sign-in work you must create your own OAuth client:
 > ~100 test users.
 
 ### User setup
-1. Open the **PASRS 4.3** Google Sheet and **File → Make a copy** into your own
-   Drive (this keeps the bound Apps Script — an xlsx export does not). Fill in
-   Step 3 (your team pokepaste) once.
-2. Copy your copy's **spreadsheet ID** from the URL
-   (`https://docs.google.com/spreadsheets/d/<THIS_PART>/edit`).
-3. In the PASRS Helper side panel → **Settings → Google Sheets**, enable
-   **Log recorded replays to Google Sheets**, click **Sign in with Google**, and
-   paste the spreadsheet ID.
+1. In the PASRS Helper side panel → **Settings → Google Sheets**, enable
+   **Log recorded replays to Google Sheets** and click **Sign in with Google**.
+2. Click **Create tracker** — the extension makes a fresh PASRS sheet in your
+   Drive and fills in its ID automatically. (Alternatively, paste the ID of an
+   existing PASRS sheet you imported into Google Sheets.)
+3. Optionally paste your team's pokepaste URL and click **Update team in sheet**
+   to populate the Usage Stats page.
 
-From then on, each recorded replay is added to the HomePage link list and the
-template's script updates all the dashboards. The settings panel links to your
-tracker.
-
-The template is bundled as `pasrs-template.xlsx` and uploaded via the Drive API
-(`files.create`, multipart, converting to a Google Sheet). This only needs the
-`drive.file` scope because the extension is creating the file.
+From then on, each recorded replay is parsed by the extension and written into
+`Base Data`, and the template's formulas update every dashboard. The settings
+panel links to your tracker.
 
 ## Maintainers / Credits
 The project is maintained by the following individuals:<br>

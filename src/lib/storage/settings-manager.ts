@@ -79,6 +79,7 @@ export class SettingsManager {
 			log_to_sheets: false,
 			sheets_spreadsheet_id: '',
 			sheets_sheet_name: 'Sheet1',
+			sheets_team_paste_url: '',
 		};
 	}
 

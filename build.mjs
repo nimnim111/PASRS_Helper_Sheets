@@ -14,9 +14,10 @@ const distDir = resolve(outputDir, 'dist');
 const manifestPath = resolve(__dirname, 'manifest.base.json');
 const packageJsonPath = resolve(__dirname, 'package.json');
 const iconPath = resolve(__dirname, '128.png');
+const templatePath = resolve(__dirname, 'pasrs-template.xlsx');
 
 const FIREFOX_ID =
-	'"gecko": {"id": "pasrs-helper@malaow3.com","strict_min_version": "109.0"}';
+	'"gecko": {"id": "pasrs-helper@nimnim111","strict_min_version": "109.0"}';
 
 function getProvidedChunkIds(code) {
 	const match = code.match(/\.push\(\[\[([^\]]+)\],/);
@@ -144,6 +145,9 @@ function build(target = 'chrome') {
 	manifest.version = version;
 
 	copyFileSync(iconPath, resolve(outputDir, '128.png'));
+	// The PASRS sheet template the extension uploads (via Drive) to auto-create a
+	// tracker. Fetched at runtime through chrome.runtime.getURL.
+	copyFileSync(templatePath, resolve(outputDir, 'pasrs-template.xlsx'));
 
 	if (target === 'firefox') {
 		manifest.browser_specific_settings = JSON.parse(`{${FIREFOX_ID}}`);
