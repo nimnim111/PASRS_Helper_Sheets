@@ -3,8 +3,13 @@ import type {
 	SheetsRequestData,
 	SheetsResponse,
 } from '../lib/events';
-import { replayJsonUrl, replayToData } from '../lib/sheets/replay-to-data';
+import {
+	replayJsonUrl,
+	replayPlayers,
+	replayToData,
+} from '../lib/sheets/replay-to-data';
 import { teamFromPaste } from '../lib/sheets/team-from-paste';
+import { teamIdentifier, toId } from '../lib/sheets/team-id';
 
 // Background service worker: the only context that may use chrome.identity and
 // hold an OAuth token. It signs the user in, then for each recorded replay it
@@ -28,8 +33,15 @@ const DRIVE_UPLOAD =
 	'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id';
 const TEMPLATE_FILE = 'pasrs-template.xlsx';
 const NEW_SHEET_NAME = 'PASRS Tracker';
+// All trackers are created inside this Drive folder (created on first use).
+const TRACKER_FOLDER_NAME = 'PASRS Trackers';
+const DRIVE_FILES = 'https://www.googleapis.com/drive/v3/files';
 const TOKEN_STORAGE_KEY = 'pasrs_sheets_token';
 const SPREADSHEET_STORAGE_KEY = 'pasrs_sheets_spreadsheet_id';
+const FOLDER_STORAGE_KEY = 'pasrs_sheets_folder_id';
+// Map of team identifier -> spreadsheet id, so each distinct team reuses its own
+// tracker instead of creating a duplicate every game.
+const SPREADSHEET_MAP_KEY = 'pasrs_sheets_by_team';
 // Spreadsheets whose custom-function cells we've already neutralised.
 const PREPARED_STORAGE_KEY = 'pasrs_sheets_prepared';
 
@@ -98,6 +110,38 @@ async function getStoredSpreadsheetId(): Promise<string | null> {
 
 async function setStoredSpreadsheetId(id: string): Promise<void> {
 	await chrome.storage.local.set({ [SPREADSHEET_STORAGE_KEY]: id });
+}
+
+async function getStoredFolderId(): Promise<string | null> {
+	const stored = await chrome.storage.local.get(FOLDER_STORAGE_KEY);
+	return (stored[FOLDER_STORAGE_KEY] as string | undefined) ?? null;
+}
+
+async function setStoredFolderId(id: string): Promise<void> {
+	await chrome.storage.local.set({ [FOLDER_STORAGE_KEY]: id });
+}
+
+async function getTeamSpreadsheetMap(): Promise<Record<string, string>> {
+	const stored = await chrome.storage.local.get(SPREADSHEET_MAP_KEY);
+	return (stored[SPREADSHEET_MAP_KEY] as Record<string, string> | undefined) ?? {};
+}
+
+async function getStoredSpreadsheetForTeam(
+	teamId: string,
+): Promise<string | null> {
+	if (!teamId) return null;
+	const map = await getTeamSpreadsheetMap();
+	return map[teamId] ?? null;
+}
+
+async function setStoredSpreadsheetForTeam(
+	teamId: string,
+	id: string,
+): Promise<void> {
+	if (!teamId) return;
+	const map = await getTeamSpreadsheetMap();
+	map[teamId] = id;
+	await chrome.storage.local.set({ [SPREADSHEET_MAP_KEY]: map });
 }
 
 async function getPreparedIds(): Promise<string[]> {
@@ -260,20 +304,91 @@ async function expectOk(response: Response): Promise<void> {
 	}
 }
 
+// A raw Drive API call with 401 refresh handling.
+async function driveFetch(
+	tokenRef: TokenRef,
+	url: string,
+	init: RequestInit,
+	label: string,
+): Promise<Response> {
+	const doFetch = (token: string) =>
+		fetchWithRetry(label, () =>
+			fetch(url, {
+				...init,
+				headers: { ...init.headers, Authorization: `Bearer ${token}` },
+			}),
+		);
+	let response = await doFetch(tokenRef.token);
+	if (response.status === 401) {
+		await removeCachedToken(tokenRef.token);
+		const refreshed = await getAuthToken(false);
+		if (refreshed) {
+			tokenRef.token = refreshed;
+			response = await doFetch(refreshed);
+		}
+	}
+	return response;
+}
+
+// Return the id of the "PASRS Trackers" folder, creating it (and caching the id)
+// if we don't have a usable one. drive.file lets us create/own this folder and
+// place the trackers we create inside it.
+async function ensureFolder(tokenRef: TokenRef): Promise<string> {
+	const stored = await getStoredFolderId();
+	if (stored) {
+		const check = await driveFetch(
+			tokenRef,
+			`${DRIVE_FILES}/${stored}?fields=trashed`,
+			{ method: 'GET' },
+			'drive folder check',
+		);
+		if (check.ok) {
+			const json = (await check.json()) as { trashed?: boolean };
+			if (json.trashed !== true) return stored;
+		}
+	}
+	const response = await driveFetch(
+		tokenRef,
+		`${DRIVE_FILES}?fields=id`,
+		{
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				name: TRACKER_FOLDER_NAME,
+				mimeType: 'application/vnd.google-apps.folder',
+			}),
+		},
+		'drive folder create',
+	);
+	if (!response.ok) {
+		const text = await response.text().catch(() => '');
+		throw new Error(`Drive API ${response.status}: ${text}`);
+	}
+	const json = (await response.json()) as { id?: string };
+	if (!json.id) throw new Error('Drive folder create returned no id');
+	await setStoredFolderId(json.id);
+	return json.id;
+}
+
 // Upload the bundled xlsx template to Drive, converting it to a Google Sheet,
-// and return the new spreadsheet's id. Needs only the drive.file scope (the
-// extension is creating the file).
-async function createFromTemplate(tokenRef: TokenRef): Promise<string> {
+// and return the new spreadsheet's id. Placed inside the PASRS Trackers folder
+// and named so the title identifies the team. Needs only the drive.file scope.
+async function createFromTemplate(
+	tokenRef: TokenRef,
+	name?: string,
+): Promise<string> {
 	const templateRes = await fetchWithRetry('template', () =>
 		fetch(chrome.runtime.getURL(TEMPLATE_FILE)),
 	);
 	if (!templateRes.ok) throw new Error('Bundled template missing');
 	const xlsx = await templateRes.blob();
 
+	const folderId = await ensureFolder(tokenRef);
 	const boundary = `pasrs${Date.now()}`;
 	const metadata = {
-		name: NEW_SHEET_NAME,
+		name: name?.trim() || NEW_SHEET_NAME,
 		mimeType: 'application/vnd.google-apps.spreadsheet',
+		parents: [folderId],
 	};
 	const body = new Blob([
 		`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n`,
@@ -343,11 +458,43 @@ async function isUsableSpreadsheet(
 // Use the provided id (or stored one) if it's still usable; otherwise auto-create
 // a fresh tracker. This makes the tracker self-healing — if you trash or lose the
 // old sheet, the next recorded game just makes a new one.
+// A spreadsheet title that uniquely identifies the team it tracks.
+function trackerTitle(teamId?: string, teamName?: string): string {
+	const name = teamName?.trim();
+	if (teamId && name) return `PASRS — ${name} [${teamId}]`;
+	if (teamId) return `PASRS — ${teamId}`;
+	return NEW_SHEET_NAME;
+}
+
 async function resolveSpreadsheetId(
 	tokenRef: TokenRef,
 	provided?: string,
+	teamId?: string,
+	teamName?: string,
 ): Promise<string> {
-	const existing = provided || (await getStoredSpreadsheetId());
+	// An explicitly-configured id always wins (legacy single-sheet setups).
+	if (provided) {
+		if (await isUsableSpreadsheet(tokenRef, provided)) return provided;
+		const id = await createFromTemplate(tokenRef, trackerTitle(teamId, teamName));
+		await setStoredSpreadsheetId(id);
+		return id;
+	}
+
+	// Otherwise, if we know the team, reuse that team's tracker if it still
+	// exists — the identifier is what stops us making a duplicate each game.
+	if (teamId) {
+		const forTeam = await getStoredSpreadsheetForTeam(teamId);
+		if (forTeam && (await isUsableSpreadsheet(tokenRef, forTeam))) {
+			return forTeam;
+		}
+		const id = await createFromTemplate(tokenRef, trackerTitle(teamId, teamName));
+		await setStoredSpreadsheetForTeam(teamId, id);
+		await setStoredSpreadsheetId(id);
+		return id;
+	}
+
+	// No team match: fall back to the single default tracker.
+	const existing = await getStoredSpreadsheetId();
 	if (existing && (await isUsableSpreadsheet(tokenRef, existing))) {
 		return existing;
 	}
@@ -535,11 +682,38 @@ async function handleLog(data?: SheetsRequestData): Promise<SheetsResponse> {
 	const tokenRef: TokenRef = { token: initialToken };
 
 	try {
-		let spreadsheetId = await resolveSpreadsheetId(tokenRef, provided);
+		// Fetch the replay first so we can tell which of the user's teams was used
+		// (before deciding which tracker to write to).
+		const jsonText = await fetchReplayJson(url);
+
+		// Work out the signed-in player's side and their team-preview species, then
+		// derive the team identifier. The identifier keys the per-team tracker so a
+		// team that already has a sheet reuses it instead of spawning a duplicate.
+		const playerName = data?.payload?.playerName?.trim() ?? '';
+		const { p1, p2, team1, team2 } = replayPlayers(jsonText);
+		let playerSpecies: string[] = [];
+		if (playerName && toId(playerName) === toId(p1)) playerSpecies = team1;
+		else if (playerName && toId(playerName) === toId(p2)) playerSpecies = team2;
+		const teamId = teamIdentifier(playerSpecies);
+
+		// Find the matching teambuilder team (for auto-filling the team section).
+		const matchedTeam = (data?.availableTeams ?? []).find(
+			(t) => t.id === teamId,
+		);
+
+		let spreadsheetId = await resolveSpreadsheetId(
+			tokenRef,
+			provided,
+			matchedTeam ? teamId : undefined,
+			matchedTeam?.name,
+		);
 		let titles = await getSheetTitles(tokenRef, spreadsheetId);
 		if (!titles.has(REPLAY_ENTRIES) || !titles.has(BASE_DATA)) {
 			// Wrong template version (e.g. old PASRS 4.3 tracker) — create a fresh one.
-			spreadsheetId = await createFromTemplate(tokenRef);
+			spreadsheetId = await createFromTemplate(
+				tokenRef,
+				trackerTitle(matchedTeam ? teamId : undefined, matchedTeam?.name),
+			);
 			titles = await getSheetTitles(tokenRef, spreadsheetId);
 			if (!titles.has(REPLAY_ENTRIES) || !titles.has(BASE_DATA)) {
 				return {
@@ -547,10 +721,34 @@ async function handleLog(data?: SheetsRequestData): Promise<SheetsResponse> {
 					error: 'Created a new tracker but it is missing required sheets.',
 				};
 			}
+			if (matchedTeam) await setStoredSpreadsheetForTeam(teamId, spreadsheetId);
 		}
 		// Remember whatever we actually resolved.
 		await setStoredSpreadsheetId(spreadsheetId);
 		await ensurePrepared(tokenRef, spreadsheetId);
+
+		// Auto-fill the team section the first time this tracker is used, so the
+		// Usage Stats dashboard populates without the user picking a team manually.
+		if (matchedTeam && matchedTeam.column.length > 0) {
+			const teamCell = await readValues(
+				tokenRef,
+				spreadsheetId,
+				TEAM_INFO,
+				'A1',
+			);
+			if (!(teamCell[0]?.[0] ?? '').trim()) {
+				await writeColumnRaw(
+					tokenRef,
+					spreadsheetId,
+					TEAM_INFO,
+					`A1:A${matchedTeam.column.length}`,
+					matchedTeam.column,
+				);
+				// Record the team identifier on the Home sheet's paste cell so the
+				// tracker is traceable back to the team that owns it.
+				await writeCell(tokenRef, spreadsheetId, HOMEPAGE, PASTE_CELL, teamId);
+			}
+		}
 
 		// Avoid duplicates and find the next free replay row.
 		const existing = await readValues(
@@ -575,7 +773,6 @@ async function handleLog(data?: SheetsRequestData): Promise<SheetsResponse> {
 		// Parse the replay and write its data row first, so the dashboards never
 		// see a replay link without its computed data. Row N in Base Data pairs
 		// with replay-link row N in Replay Entries.
-		const jsonText = await fetchReplayJson(url);
 		const dataRow = padTo(replayToData(url, jsonText), BASE_DATA_SPILL_WIDTH);
 		const baseRow = BASE_DATA_FIRST_ROW + filled;
 		await writeRowRaw(
@@ -595,7 +792,6 @@ async function handleLog(data?: SheetsRequestData): Promise<SheetsResponse> {
 		);
 
 		// Set the Showdown name once (so the template attributes games to you).
-		const playerName = data?.payload?.playerName?.trim();
 		if (playerName) {
 			const nameCell = await readValues(
 				tokenRef,
@@ -636,19 +832,30 @@ async function handleTeam(data?: SheetsRequestData): Promise<SheetsResponse> {
 	}
 
 	const provided = data?.spreadsheetId?.trim();
+	const teamId = data?.teamId?.trim();
+	const teamName = data?.teamName?.trim();
 	const initialToken = await getAuthToken(false);
 	if (!initialToken) return { ok: false, error: 'Not signed in' };
 	const tokenRef: TokenRef = { token: initialToken };
 
 	try {
-		let spreadsheetId = await resolveSpreadsheetId(tokenRef, provided);
+		let spreadsheetId = await resolveSpreadsheetId(
+			tokenRef,
+			provided,
+			teamId || undefined,
+			teamName,
+		);
 		let titles = await getSheetTitles(tokenRef, spreadsheetId);
 		if (!titles.has(TEAM_INFO)) {
-			spreadsheetId = await createFromTemplate(tokenRef);
+			spreadsheetId = await createFromTemplate(
+				tokenRef,
+				trackerTitle(teamId || undefined, teamName),
+			);
 			titles = await getSheetTitles(tokenRef, spreadsheetId);
 			if (!titles.has(TEAM_INFO)) {
 				return { ok: false, error: "Created a new tracker but it is missing 'Team Info From Paste'." };
 			}
+			if (teamId) await setStoredSpreadsheetForTeam(teamId, spreadsheetId);
 		}
 		// Remember whatever we actually resolved.
 		await setStoredSpreadsheetId(spreadsheetId);
@@ -671,8 +878,11 @@ async function handleTeam(data?: SheetsRequestData): Promise<SheetsResponse> {
 			`A1:A${team.length}`,
 			team,
 		);
-		// Record the source paste on the HomePage too (harmless if unused).
-		if (pasteUrl) {
+		// Record the team identifier (or source paste) on the Home sheet so the
+		// tracker is traceable back to the team that owns it.
+		if (teamId) {
+			await writeCell(tokenRef, spreadsheetId, HOMEPAGE, PASTE_CELL, teamId);
+		} else if (pasteUrl) {
 			await writeCell(tokenRef, spreadsheetId, HOMEPAGE, PASTE_CELL, pasteUrl);
 		}
 

@@ -1,0 +1,2309 @@
+import type {
+	SheetsAction,
+	SheetsRequestData,
+	SheetsResponse,
+} from '../lib/events';
+import { replayJsonUrl, replayToData } from '../lib/sheets/replay-to-data';
+import { teamFromPaste } from '../lib/sheets/team-from-paste';
+
+// Background service worker: the only context that may use chrome.identity and
+// hold an OAuth token. It signs the user in, then for each recorded replay it
+// fetches + parses the battle and writes the parsed data into the PASRS
+// template's source sheets (`Base Data`, `Team Info From Paste`). This
+// reproduces the template's own custom functions (REPLAYTODATA /
+// TEAMDATAFROMPASTE), which are lost when the sheet is exported as xlsx, so the
+// template's plain formula-driven dashboards render identically — no Apps Script.
+//
+// Messages arrive from the content script (which relays them from the page).
+
+interface BackgroundMessage {
+	action: SheetsAction;
+	data?: SheetsRequestData;
+}
+
+const SHEETS_API = 'https://sheets.googleapis.com/v4/spreadsheets';
+// Drive multipart upload endpoint, used to create the tracker from the bundled
+// xlsx template (converted to a Google Sheet on upload).
+const DRIVE_UPLOAD =
+	'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id';
+const TEMPLATE_FILE = 'pasrs-template.xlsx';
+const NEW_SHEET_NAME = 'PASRS Tracker';
+const TOKEN_STORAGE_KEY = 'pasrs_sheets_token';
+const SPREADSHEET_STORAGE_KEY = 'pasrs_sheets_spreadsheet_id';
+// Spreadsheets whose custom-function cells we've already neutralised.
+const PREPARED_STORAGE_KEY = 'pasrs_sheets_prepared';
+
+// PASRS HomePage layout: replay links go in C14:C113, the Showdown name in G6,
+// the team pokepaste URL in G8.
+const HOMEPAGE = 'HomePage';
+const REPLAY_RANGE = 'C14:C113';
+const REPLAY_FIRST_ROW = 14;
+const REPLAY_MAX = 100;
+const NAME_CELL = 'G6';
+const PASTE_CELL = 'G8';
+
+// `Base Data` holds one "spill" row per game (REPLAYTODATA's output) that every
+// downstream formula reads. Row 3 pairs with HomePage replay-link row 14, and so
+// on. The spill occupies columns B..CT; helper formulas live in CU onward and
+// must not be overwritten, so each game row is written across exactly B..CT.
+const BASE_DATA = 'Base Data';
+const BASE_DATA_FIRST_ROW = 3;
+const BASE_DATA_LAST_SPILL_COL = 'CT';
+const BASE_DATA_SPILL_WIDTH = 97; // columns B..CT inclusive
+
+// `Team Info From Paste` holds the player's team (TEAMDATAFROMPASTE's output)
+// down column A, starting A1.
+const TEAM_INFO = 'Team Info From Paste';
+
+// ---------------------------------------------------------------------------
+// Auth (launchWebAuthFlow on every browser — one Web-application OAuth client)
+// ---------------------------------------------------------------------------
+
+function getOAuthConfig(): { clientId: string; scopes: string[] } {
+	const oauth2 = (
+		chrome.runtime.getManifest() as chrome.runtime.Manifest & {
+			oauth2?: { client_id: string; scopes: string[] };
+		}
+	).oauth2;
+	return {
+		clientId: oauth2?.client_id ?? '',
+		// Updated to use non-sensitive drive.file scope so custom domains are not required
+		scopes: oauth2?.scopes ?? ['https://www.googleapis.com/auth/drive.file'],
+	};
+}
+
+interface StoredToken {
+	token: string;
+	expiresAt: number;
+}
+
+async function getStoredToken(): Promise<StoredToken | null> {
+	const stored = await chrome.storage.local.get(TOKEN_STORAGE_KEY);
+	return (stored[TOKEN_STORAGE_KEY] as StoredToken | undefined) ?? null;
+}
+
+async function setStoredToken(token: StoredToken | null): Promise<void> {
+	if (token) {
+		await chrome.storage.local.set({ [TOKEN_STORAGE_KEY]: token });
+	} else {
+		await chrome.storage.local.remove(TOKEN_STORAGE_KEY);
+	}
+}
+
+async function getStoredSpreadsheetId(): Promise<string | null> {
+	const stored = await chrome.storage.local.get(SPREADSHEET_STORAGE_KEY);
+	return (stored[SPREADSHEET_STORAGE_KEY] as string | undefined) ?? null;
+}
+
+async function setStoredSpreadsheetId(id: string): Promise<void> {
+	await chrome.storage.local.set({ [SPREADSHEET_STORAGE_KEY]: id });
+}
+
+async function getPreparedIds(): Promise<string[]> {
+	const stored = await chrome.storage.local.get(PREPARED_STORAGE_KEY);
+	return (stored[PREPARED_STORAGE_KEY] as string[] | undefined) ?? [];
+}
+
+async function markPrepared(id: string): Promise<void> {
+	const ids = await getPreparedIds();
+	if (!ids.includes(id)) {
+		await chrome.storage.local.set({ [PREPARED_STORAGE_KEY]: [...ids, id] });
+	}
+}
+
+function spreadsheetUrl(id: string): string {
+	return `https://docs.google.com/spreadsheets/d/${id}/edit`;
+}
+
+// Reason the last interactive sign-in failed, surfaced to the panel so failures
+// aren't a generic "Sign-in failed".
+let lastAuthError = '';
+
+// OAuth implicit flow via launchWebAuthFlow. Tokens are cached in storage (the
+// service worker / event page can be torn down between calls).
+async function getAuthToken(interactive: boolean): Promise<string | null> {
+	const cached = await getStoredToken();
+	if (cached && cached.expiresAt > Date.now() + 60000) {
+		return cached.token;
+	}
+
+	const { clientId, scopes } = getOAuthConfig();
+	const redirectUri = chrome.identity.getRedirectURL();
+	console.log('[PASRS] auth redirect_uri:', redirectUri);
+	const authParams = new URLSearchParams({
+		client_id: clientId,
+		response_type: 'token',
+		redirect_uri: redirectUri,
+		scope: scopes.join(' '),
+		prompt: interactive ? 'consent' : 'none',
+	});
+	const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${authParams.toString()}`;
+
+	let responseUrl: string | undefined;
+	try {
+		responseUrl = await chrome.identity.launchWebAuthFlow({
+			url: authUrl,
+			interactive,
+		});
+	} catch (error) {
+		lastAuthError = `Auth window failed: ${error}`;
+		console.error('[PASRS]', lastAuthError);
+		return null;
+	}
+	if (!responseUrl) {
+		lastAuthError = 'Sign-in was cancelled or blocked';
+		console.error('[PASRS]', lastAuthError, '(no redirect)');
+		return null;
+	}
+
+	// Google returns either a token (#access_token=…) or an error
+	// (?error=… / #error=…) in the redirect.
+	const hash = responseUrl.split('#')[1] ?? '';
+	const query = responseUrl.split('?')[1]?.split('#')[0] ?? '';
+	const params = new URLSearchParams(hash || query);
+	const oauthError = params.get('error');
+	if (oauthError) {
+		lastAuthError = `Google: ${oauthError}${
+			params.get('error_description')
+				? ` — ${params.get('error_description')}`
+				: ''
+		}`;
+		console.error('[PASRS]', lastAuthError);
+		return null;
+	}
+	const token = params.get('access_token');
+	if (!token) {
+		lastAuthError = 'No access token returned';
+		console.error('[PASRS]', lastAuthError, responseUrl);
+		return null;
+	}
+
+	lastAuthError = '';
+	const expiresIn = Number(params.get('expires_in') ?? '3600');
+	await setStoredToken({ token, expiresAt: Date.now() + expiresIn * 1000 });
+	return token;
+}
+
+// Drop the cached token so the next sign-in is clean. Used on sign-out and
+// after a 401 (stale/revoked token).
+async function removeCachedToken(token: string): Promise<void> {
+	await setStoredToken(null);
+	try {
+		await fetch(`https://accounts.google.com/o/oauth2/revoke?token=${token}`);
+	} catch {
+		// Best-effort revoke; ignore network failures.
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sheets API helpers
+// ---------------------------------------------------------------------------
+
+interface TokenRef {
+	token: string;
+}
+
+// fetch() that retries once on a network-level failure, then throws a labelled
+// error so failures are diagnosable.
+async function fetchWithRetry(
+	label: string,
+	request: () => Promise<Response>,
+): Promise<Response> {
+	try {
+		return await request();
+	} catch {
+		try {
+			return await request();
+		} catch (error) {
+			throw new Error(`Network error (${label}): ${error}`);
+		}
+	}
+}
+
+// Low-level Sheets API call with one automatic token refresh on 401.
+async function sheetsCall(
+	tokenRef: TokenRef,
+	path: string,
+	method: string,
+	body?: unknown,
+): Promise<Response> {
+	const label = `Sheets ${method} ${path.split('/').pop()?.split('?')[0]}`;
+	const doFetch = (token: string) =>
+		fetchWithRetry(label, () =>
+			fetch(`${SHEETS_API}/${path}`, {
+				method,
+				headers: {
+					Authorization: `Bearer ${token}`,
+					'Content-Type': 'application/json',
+				},
+				body: body === undefined ? undefined : JSON.stringify(body),
+			}),
+		);
+
+	let response = await doFetch(tokenRef.token);
+	if (response.status === 401) {
+		await removeCachedToken(tokenRef.token);
+		const refreshed = await getAuthToken(false);
+		if (refreshed) {
+			tokenRef.token = refreshed;
+			response = await doFetch(refreshed);
+		}
+	}
+	return response;
+}
+
+async function expectOk(response: Response): Promise<void> {
+	if (!response.ok) {
+		const text = await response.text().catch(() => '');
+		throw new Error(`Sheets API ${response.status}: ${text}`);
+	}
+}
+
+// Upload the bundled xlsx template to Drive, converting it to a Google Sheet,
+// and return the new spreadsheet's id. Needs only the drive.file scope (the
+// extension is creating the file).
+async function createFromTemplate(tokenRef: TokenRef): Promise<string> {
+	const templateRes = await fetchWithRetry('template', () =>
+		fetch(chrome.runtime.getURL(TEMPLATE_FILE)),
+	);
+	if (!templateRes.ok) throw new Error('Bundled template missing');
+	const xlsx = await templateRes.blob();
+
+	const boundary = `pasrs${Date.now()}`;
+	const metadata = {
+		name: NEW_SHEET_NAME,
+		mimeType: 'application/vnd.google-apps.spreadsheet',
+	};
+	const body = new Blob([
+		`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n`,
+		JSON.stringify(metadata),
+		`\r\n--${boundary}\r\nContent-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n`,
+		xlsx,
+		`\r\n--${boundary}--`,
+	]);
+
+	const upload = (token: string) =>
+		fetchWithRetry('drive create', () =>
+			fetch(DRIVE_UPLOAD, {
+				method: 'POST',
+				headers: {
+					Authorization: `Bearer ${token}`,
+					'Content-Type': `multipart/related; boundary=${boundary}`,
+				},
+				body,
+			}),
+		);
+
+	let response = await upload(tokenRef.token);
+	if (response.status === 401) {
+		await removeCachedToken(tokenRef.token);
+		const refreshed = await getAuthToken(false);
+		if (refreshed) {
+			tokenRef.token = refreshed;
+			response = await upload(refreshed);
+		}
+	}
+	if (!response.ok) {
+		const text = await response.text().catch(() => '');
+		throw new Error(`Drive API ${response.status}: ${text}`);
+	}
+	const json = (await response.json()) as { id?: string };
+	if (!json.id) throw new Error('Drive create returned no file id');
+	return json.id;
+}
+
+// Drive files.get to detect a trashed file. Returns false if Drive can't tell
+// us (e.g. a sheet the app didn't create), so we never discard a usable sheet.
+// Use Drive API (drive.file scope) to check existence + trash status.
+// The Sheets API requires the spreadsheets scope which we no longer request.
+async function isUsableSpreadsheet(
+	tokenRef: TokenRef,
+	id: string,
+): Promise<boolean> {
+	const url = `https://www.googleapis.com/drive/v3/files/${id}?fields=trashed`;
+	const doFetch = (token: string) =>
+		fetchWithRetry('drive check', () =>
+			fetch(url, { headers: { Authorization: `Bearer ${token}` } }),
+		);
+	let response = await doFetch(tokenRef.token);
+	if (response.status === 401) {
+		await removeCachedToken(tokenRef.token);
+		const refreshed = await getAuthToken(false);
+		if (refreshed) {
+			tokenRef.token = refreshed;
+			response = await doFetch(refreshed);
+		}
+	}
+	if (!response.ok) return false;
+	const json = (await response.json()) as { trashed?: boolean };
+	return json.trashed !== true;
+}
+
+// Use the provided id (or stored one) if it's still usable; otherwise auto-create
+// a fresh tracker. This makes the tracker self-healing — if you trash or lose the
+// old sheet, the next recorded game just makes a new one.
+async function resolveSpreadsheetId(
+	tokenRef: TokenRef,
+	provided?: string,
+): Promise<string> {
+	const existing = provided || (await getStoredSpreadsheetId());
+	if (existing && (await isUsableSpreadsheet(tokenRef, existing))) {
+		return existing;
+	}
+	const id = await createFromTemplate(tokenRef);
+	await setStoredSpreadsheetId(id);
+	return id;
+}
+
+function encodeA1(sheet: string, cell: string): string {
+	return encodeURIComponent(`'${sheet.replace(/'/g, "''")}'!${cell}`);
+}
+
+async function readValues(
+	tokenRef: TokenRef,
+	spreadsheetId: string,
+	sheet: string,
+	cell: string,
+): Promise<string[][]> {
+	const response = await sheetsCall(
+		tokenRef,
+		`${spreadsheetId}/values/${encodeA1(sheet, cell)}`,
+		'GET',
+	);
+	await expectOk(response);
+	const json = (await response.json()) as { values?: string[][] };
+	return json.values ?? [];
+}
+
+async function writeCell(
+	tokenRef: TokenRef,
+	spreadsheetId: string,
+	sheet: string,
+	cell: string,
+	value: string,
+): Promise<void> {
+	const response = await sheetsCall(
+		tokenRef,
+		`${spreadsheetId}/values/${encodeA1(sheet, cell)}?valueInputOption=USER_ENTERED`,
+		'PUT',
+		{ values: [[value]] },
+	);
+	await expectOk(response);
+}
+
+// Write a single horizontal row of raw values (RAW preserves exactly what the
+// parser produced — e.g. ELO strings like "1042" stay strings, the winner stays
+// numeric — matching the template's original spill).
+async function writeRowRaw(
+	tokenRef: TokenRef,
+	spreadsheetId: string,
+	sheet: string,
+	range: string,
+	values: Array<string | number>,
+): Promise<void> {
+	const response = await sheetsCall(
+		tokenRef,
+		`${spreadsheetId}/values/${encodeA1(sheet, range)}?valueInputOption=RAW`,
+		'PUT',
+		{ values: [values] },
+	);
+	await expectOk(response);
+}
+
+// Write a vertical column of raw values starting at the given top cell.
+async function writeColumnRaw(
+	tokenRef: TokenRef,
+	spreadsheetId: string,
+	sheet: string,
+	range: string,
+	values: string[],
+): Promise<void> {
+	const response = await sheetsCall(
+		tokenRef,
+		`${spreadsheetId}/values/${encodeA1(sheet, range)}?valueInputOption=RAW`,
+		'PUT',
+		{ values: values.map((v) => [v]) },
+	);
+	await expectOk(response);
+}
+
+// Without the template's bound Apps Script, the `=REPLAYTODATA(...)` cells
+// (Base Data B3:B102) and `=TEAMDATAFROMPASTE(...)` cell (Team Info A1) resolve
+// to #NAME? errors, which would poison every dashboard's formulas. The extension
+// produces those values itself, so we clear those cells once per spreadsheet
+// (leaving unfilled rows genuinely blank). This is data-safe: if B3 already
+// holds real data, the sheet was prepared before — we just record the flag.
+async function ensurePrepared(
+	tokenRef: TokenRef,
+	spreadsheetId: string,
+): Promise<void> {
+	const prepared = await getPreparedIds();
+	if (prepared.includes(spreadsheetId)) return;
+
+	const b3 = await readValues(tokenRef, spreadsheetId, BASE_DATA, 'B3');
+	const value = (b3[0]?.[0] ?? '').trim();
+	const isFresh = value === '' || value.startsWith('#');
+	if (isFresh) {
+		const response = await sheetsCall(
+			tokenRef,
+			`${spreadsheetId}/values:batchClear`,
+			'POST',
+			{
+				ranges: [
+					`'${BASE_DATA}'!B${BASE_DATA_FIRST_ROW}:${BASE_DATA_LAST_SPILL_COL}102`,
+					`'${TEAM_INFO}'!A1:A100`,
+					// Also reset the HomePage inputs so a sheet created from the
+					// bundled template doesn't start with the template's sample data.
+					`'${HOMEPAGE}'!${REPLAY_RANGE}`,
+					`'${HOMEPAGE}'!${NAME_CELL}`,
+					`'${HOMEPAGE}'!${PASTE_CELL}`,
+				],
+			},
+		);
+		await expectOk(response);
+	}
+	await markPrepared(spreadsheetId);
+}
+
+// Fetch the replay log JSON (lives at `<replay url>.json`). Covered by the
+// pokemonshowdown.com host permission.
+async function fetchReplayJson(url: string): Promise<string> {
+	const response = await fetchWithRetry('replay json', () =>
+		fetch(replayJsonUrl(url)),
+	);
+	if (!response.ok) {
+		throw new Error(`Could not fetch replay (${response.status})`);
+	}
+	return response.text();
+}
+
+// Fetch a pokepaste HTML page (covered by the pokepast.es host permission).
+async function fetchPasteHtml(url: string): Promise<string> {
+	const response = await fetchWithRetry('pokepaste', () => fetch(url));
+	if (!response.ok) {
+		throw new Error(`Could not fetch pokepaste (${response.status})`);
+	}
+	return response.text();
+}
+
+// Trim/pad a parsed row to a fixed width so writing it cleanly overwrites any
+// stale spill cells without ever touching the helper-formula columns.
+function padTo(
+	values: Array<string | number>,
+	width: number,
+): Array<string | number> {
+	const out = values.slice(0, width);
+	while (out.length < width) out.push('');
+	return out;
+}
+
+// The set of tab titles present, to confirm this is a PASRS spreadsheet.
+async function getSheetTitles(
+	tokenRef: TokenRef,
+	spreadsheetId: string,
+): Promise<Set<string>> {
+	const response = await sheetsCall(
+		tokenRef,
+		`${spreadsheetId}?fields=sheets.properties.title`,
+		'GET',
+	);
+	await expectOk(response);
+	const json = (await response.json()) as {
+		sheets?: Array<{ properties?: { title?: string } }>;
+	};
+	return new Set(
+		(json.sheets ?? [])
+			.map((s) => s.properties?.title)
+			.filter((t): t is string => Boolean(t)),
+	);
+}
+
+// ---------------------------------------------------------------------------
+// Message handlers
+// ---------------------------------------------------------------------------
+
+async function handleLog(data?: SheetsRequestData): Promise<SheetsResponse> {
+	const url = data?.payload?.url?.trim();
+	if (!url) return { ok: false, error: 'No replay URL' };
+
+	const provided = data?.spreadsheetId?.trim();
+	const initialToken = await getAuthToken(false);
+	if (!initialToken) return { ok: false, error: 'Not signed in' };
+	const tokenRef: TokenRef = { token: initialToken };
+
+	try {
+		const spreadsheetId = await resolveSpreadsheetId(tokenRef, provided);
+		const titles = await getSheetTitles(tokenRef, spreadsheetId);
+		if (!titles.has(HOMEPAGE) || !titles.has(BASE_DATA)) {
+			return {
+				ok: false,
+				error:
+					"That spreadsheet isn't a PASRS tracker (no 'HomePage' / 'Base Data').",
+			};
+		}
+		// Remember whatever we actually resolved (the provided id, or a freshly
+		// created one if the old sheet was missing/trashed).
+		await setStoredSpreadsheetId(spreadsheetId);
+		await ensurePrepared(tokenRef, spreadsheetId);
+
+		// Avoid duplicates and find the next free replay row.
+		const existing = await readValues(
+			tokenRef,
+			spreadsheetId,
+			HOMEPAGE,
+			REPLAY_RANGE,
+		);
+		const links = existing.map((row) => (row[0] ?? '').trim());
+		if (links.includes(url)) {
+			return {
+				ok: true,
+				spreadsheetId,
+				spreadsheetUrl: spreadsheetUrl(spreadsheetId),
+			};
+		}
+		const filled = links.filter(Boolean).length;
+		if (filled >= REPLAY_MAX) {
+			return { ok: false, error: 'Replay list is full (100 games)' };
+		}
+
+		// Parse the replay and write its data row first, so the dashboards never
+		// see a replay link without its computed data. Row N in Base Data pairs
+		// with replay-link row N on the HomePage.
+		const jsonText = await fetchReplayJson(url);
+		const dataRow = padTo(replayToData(url, jsonText), BASE_DATA_SPILL_WIDTH);
+		const baseRow = BASE_DATA_FIRST_ROW + filled;
+		await writeRowRaw(
+			tokenRef,
+			spreadsheetId,
+			BASE_DATA,
+			`B${baseRow}:${BASE_DATA_LAST_SPILL_COL}${baseRow}`,
+			dataRow,
+		);
+
+		await writeCell(
+			tokenRef,
+			spreadsheetId,
+			HOMEPAGE,
+			`C${REPLAY_FIRST_ROW + filled}`,
+			url,
+		);
+
+		// Set the Showdown name once (so the template attributes games to you).
+		const playerName = data?.payload?.playerName?.trim();
+		if (playerName) {
+			const nameCell = await readValues(
+				tokenRef,
+				spreadsheetId,
+				HOMEPAGE,
+				NAME_CELL,
+			);
+			if (!(nameCell[0]?.[0] ?? '').trim()) {
+				await writeCell(
+					tokenRef,
+					spreadsheetId,
+					HOMEPAGE,
+					NAME_CELL,
+					playerName,
+				);
+			}
+		}
+
+		return {
+			ok: true,
+			spreadsheetId,
+			spreadsheetUrl: spreadsheetUrl(spreadsheetId),
+		};
+	} catch (error) {
+		return { ok: false, error: String(error) };
+	}
+}
+
+// Write the player's team into `Team Info From Paste` so the Usage Stats
+// dashboard (which is keyed off the player's own team) renders. The team comes
+// either pre-built from a chosen Showdown team (data.teamData) or from a
+// pokepaste URL the background fetches and parses.
+async function handleTeam(data?: SheetsRequestData): Promise<SheetsResponse> {
+	const teamData = data?.teamData;
+	const pasteUrl = data?.teamPasteUrl?.trim();
+	if ((!teamData || teamData.length === 0) && !pasteUrl) {
+		return { ok: false, error: 'No team selected' };
+	}
+
+	const provided = data?.spreadsheetId?.trim();
+	const initialToken = await getAuthToken(false);
+	if (!initialToken) return { ok: false, error: 'Not signed in' };
+	const tokenRef: TokenRef = { token: initialToken };
+
+	try {
+		const spreadsheetId = await resolveSpreadsheetId(tokenRef, provided);
+		const titles = await getSheetTitles(tokenRef, spreadsheetId);
+		if (!titles.has(TEAM_INFO)) {
+			return {
+				ok: false,
+				error: "That spreadsheet isn't a PASRS tracker.",
+			};
+		}
+		// Remember whatever we actually resolved (the provided id, or a freshly
+		// created one if the old sheet was missing/trashed).
+		await setStoredSpreadsheetId(spreadsheetId);
+		await ensurePrepared(tokenRef, spreadsheetId);
+
+		let team: string[];
+		if (teamData && teamData.length > 0) {
+			team = teamData;
+		} else {
+			const html = await fetchPasteHtml(pasteUrl as string);
+			team = teamFromPaste(html);
+		}
+		if (team.length === 0) {
+			return { ok: false, error: 'No Pokémon found in that team' };
+		}
+		await writeColumnRaw(
+			tokenRef,
+			spreadsheetId,
+			TEAM_INFO,
+			`A1:A${team.length}`,
+			team,
+		);
+		// Record the source paste on the HomePage too (harmless if unused).
+		if (pasteUrl) {
+			await writeCell(tokenRef, spreadsheetId, HOMEPAGE, PASTE_CELL, pasteUrl);
+		}
+
+		return {
+			ok: true,
+			spreadsheetId,
+			spreadsheetUrl: spreadsheetUrl(spreadsheetId),
+		};
+	} catch (error) {
+		return { ok: false, error: String(error) };
+	}
+}
+
+// Explicitly create a fresh tracker from the bundled template (the "Create
+// tracker" button), prepare it, and return its id so the UI can fill it in.
+async function handleCreate(): Promise<SheetsResponse> {
+	const initialToken = await getAuthToken(false);
+	if (!initialToken) return { ok: false, error: 'Not signed in' };
+	const tokenRef: TokenRef = { token: initialToken };
+	try {
+		const id = await createFromTemplate(tokenRef);
+		await setStoredSpreadsheetId(id);
+		await ensurePrepared(tokenRef, id);
+		return {
+			ok: true,
+			spreadsheetId: id,
+			spreadsheetUrl: spreadsheetUrl(id),
+		};
+	} catch (error) {
+		return { ok: false, error: String(error) };
+	}
+}
+
+// Report which spreadsheet will be used so the settings panel can link to it.
+async function handleSpreadsheet(
+	data?: SheetsRequestData,
+): Promise<SheetsResponse> {
+	const provided = data?.spreadsheetId?.trim();
+	const id = provided || (await getStoredSpreadsheetId());
+	if (!id) return { ok: true };
+	return { ok: true, spreadsheetId: id, spreadsheetUrl: spreadsheetUrl(id) };
+}
+
+async function handleMessage(
+	message: BackgroundMessage,
+): Promise<SheetsResponse> {
+	switch (message.action) {
+		case 'auth': {
+			const token = await getAuthToken(true);
+			return {
+				ok: !!token,
+				signedIn: !!token,
+				error: token ? undefined : lastAuthError || undefined,
+			};
+		}
+		case 'status': {
+			const token = await getAuthToken(false);
+			return { ok: true, signedIn: !!token };
+		}
+		case 'signout': {
+			const token = await getAuthToken(false);
+			if (token) await removeCachedToken(token);
+			return { ok: true, signedIn: false };
+		}
+		case 'log':
+			return handleLog(message.data);
+		case 'team':
+			return handleTeam(message.data);
+		case 'create':
+			return handleCreate();
+		case 'spreadsheet':
+			return handleSpreadsheet(message.data);
+		default:
+			return { ok: false, error: `Unknown action: ${message.action}` };
+	}
+}
+
+chrome.runtime.onMessage.addListener(
+	(message: BackgroundMessage, _sender, sendResponse) => {
+		console.log('[PASRS] request:', message.action, message.data);
+		handleMessage(message)
+			.then((response) => {
+				console.log('[PASRS] response:', message.action, response);
+				sendResponse(response);
+			})
+			.catch((error) => {
+				console.error('[PASRS] handler threw:', message.action, error);
+				sendResponse({ ok: false, error: String(error) });
+			});
+		return true; // keep the message channel open for the async response
+	},
+);
+// Faithful TypeScript port of the PASRS 7 `REPLAYTODATA` Apps Script function.
+// The template's dashboards are driven by plain spreadsheet formulas that read
+// a per-game "spill" row out of the `Base Data` sheet.
+//
+// Output column order (matches PASRS 7 Base Data layout, starting at col B):
+//   B            p1
+//   C..H         team1[0..5]
+//   I            p2
+//   J..O         team2[0..5]
+//   P            winner (1 or 2)
+//   Q            p1MegaMon
+//   R            "" (reserved)
+//   S            p2MegaMon
+//   T            "" (reserved)
+//   U..X         team1leads[0..1], team2leads[0..1]
+//   Y            "ots" | "cts"
+//   Z..AC        p1StartELO, p2StartELO, p1EndELO, p2EndELO
+//   AD..AG       bo3("true"|""), setGameCount, lastGame("yes"/"no"|""), timestamp
+//   AH..AM       "p1: 0", alignLeft, "vs", alignRight, "p2: 0", url
+//   AN..AQ       team1used[0..3]
+//   AR..AU       team2used[0..3]
+//   AV..         "P1 MOVES START", p1 combos…, "P1 MOVES END",
+//                "P2 MOVES START", p2 combos…, "P2 MOVES END"
+
+type Cell = string | number;
+
+interface ReplayJson {
+	uploadtime?: number;
+	log: string;
+	format?: string;
+}
+
+class MoveCount {
+	moveName: string;
+	moveCount = 1;
+	constructor(moveName: string) {
+		this.moveName = moveName;
+	}
+	addOne(): void {
+		this.moveCount++;
+	}
+}
+
+class PokemonMoveListing {
+	pokemonName: string;
+	moveCounts: MoveCount[] = [];
+	constructor(name: string) {
+		this.pokemonName = name;
+	}
+	useMove(move: string): void {
+		const existing = this.moveCounts.find((m) => m.moveName === move);
+		if (existing) existing.addOne();
+		else this.moveCounts.push(new MoveCount(move));
+	}
+}
+
+class MoveManager {
+	playerMoveListings: PokemonMoveListing[] = [];
+	addMove(mon: string, move: string): void {
+		const existing = this.playerMoveListings.find((l) => l.pokemonName === mon);
+		if (existing) existing.useMove(move);
+		else {
+			const listing = new PokemonMoveListing(mon);
+			listing.useMove(move);
+			this.playerMoveListings.push(listing);
+		}
+	}
+}
+
+interface Nickname {
+	realName: string;
+	nickname: string;
+}
+
+function fixSpecialChars(text: string): string {
+	return text
+		.replace(/&#39;/g, "'")
+		.replace(/&#34;/g, '"')
+		.replace(/&amp;/g, '&')
+		.replace(/&gt;/g, '>')
+		.replace(/&lt;/g, '<')
+		.replace(/&apos;/g, "'");
+}
+
+function normaliseSwitchName(name: string): string {
+	let mon = name;
+	if (mon === 'Palafin-Hero') mon = 'Palafin';
+	if (mon === 'Terapagos-Terastal' || mon === 'Terapagos-Stellar') mon = 'Terapagos';
+	if (mon.includes('-Teal-Tera')) mon = 'Ogerpon';
+	if (mon.includes('-Tera')) mon = mon.replace('-Tera', '');
+	if (mon.includes('-Mega-Y')) mon = mon.replace('-Mega-Y', '');
+	if (mon.includes('-Mega-X')) mon = mon.replace('-Mega-X', '');
+	if (mon.includes('-Mega')) mon = mon.replace('-Mega', '');
+	return mon;
+}
+
+export function replayToData(url: string, jsonText: string): Cell[] {
+	let replayUrl = url;
+	if (replayUrl.slice(-3) === '?p2') replayUrl = replayUrl.slice(0, -3);
+
+	const replay = JSON.parse(jsonText) as ReplayJson;
+	const gameLog = (replay.log ?? '').split('\n');
+	const format = replay.format ?? '';
+	const timestamp = replay.uploadtime;
+
+	let ladder = false;
+	let ots = false;
+	let numPlayersAgreeToOTS = 0;
+	let hasELO = false;
+
+	let setGameCount: string | number = 0;
+	const setP1winCount = 0;
+	const setP2winCount = 0;
+	let advantagePlayer = '';
+	let lastGameOfSet = false;
+
+	let p1 = '';
+	let p2 = '';
+	let p1StartELO: string | undefined;
+	let p1EndELO: string | undefined;
+	let p2StartELO: string | undefined;
+	let p2EndELO: string | undefined;
+
+	let alignLeftPlayer: string | undefined;
+	let alignRightPlayer: string | undefined;
+
+	const team1: string[] = [];
+	const team2: string[] = [];
+	const team1leads: string[] = [];
+	const team2leads: string[] = [];
+	const team1used: string[] = [];
+	const team2used: string[] = [];
+	const team1nicknames: Nickname[] = [];
+	const team2nicknames: Nickname[] = [];
+
+	// Tera vars kept for tracking but not output in PASRS 7
+	let p1TeraMon: string | undefined;
+	let p2TeraMon: string | undefined;
+	let p1TeraType: string | undefined;
+	let p2TeraType: string | undefined;
+
+	let p1MegaMon: string | undefined;
+	let p2MegaMon: string | undefined;
+
+	const p1Moves = new MoveManager();
+	const p2Moves = new MoveManager();
+
+	let winoutp: number | undefined;
+
+	for (let logIndex = 0; logIndex < gameLog.length; logIndex++) {
+		const line = gameLog[logIndex];
+		const tokens = line.split('|');
+
+		if (tokens[1] === 'html' && tokens[2]?.startsWith('<table width=')) {
+			alignLeftPlayer = tokens[2].split('<td align="left">')[1]?.split('</td>')[0];
+			alignRightPlayer = tokens[2].split('<td align="right">')[1]?.split('</tr>')[0];
+			if (alignLeftPlayer && alignRightPlayer) {
+				const afterRight = tokens[2].split(alignRightPlayer)[1] ?? '';
+				const parts = afterRight.split('align="right"');
+				if (parts[0]?.includes('"fa fa-circle"')) advantagePlayer = alignLeftPlayer;
+				if (parts[1]?.includes('"fa fa-circle"')) advantagePlayer = alignRightPlayer;
+			}
+		}
+
+		if (tokens[1] === 'uhtml' && tokens[2] === 'bestof') {
+			setGameCount = tokens[3]?.charAt(17) ?? 0;
+			if (setGameCount == 3) lastGameOfSet = true;
+		}
+
+		if (tokens[1] === 'player') {
+			if (tokens[2] === 'p1' && p1 === '') p1 = tokens[3];
+			else if (tokens[2] === 'p2' && p2 === '') p2 = tokens[3];
+		}
+
+		if (tokens[1] === 'poke') {
+			if (tokens[2] === 'p1') team1.push(tokens[3].split(',')[0]);
+			else if (tokens[2] === 'p2') team2.push(tokens[3].split(',')[0]);
+		}
+
+		if (tokens[1] === 'switch' || tokens[1] === 'drag') {
+			const idstuff = tokens[2].split(': ');
+			const tempNickname = idstuff[1];
+			const monTempName = normaliseSwitchName(tokens[3].split(',')[0]);
+			const newNick: Nickname = { realName: monTempName, nickname: tempNickname };
+
+			if (idstuff[0].includes('1')) {
+				if (team1leads.length < 2 && !team1leads.includes(monTempName))
+					team1leads.push(monTempName);
+				if (!team1used.includes(monTempName)) {
+					team1used.push(monTempName);
+					team1nicknames.push(newNick);
+				}
+			}
+			if (idstuff[0].includes('2')) {
+				if (team2leads.length < 2 && !team2leads.includes(monTempName))
+					team2leads.push(monTempName);
+				if (!team2used.includes(monTempName)) {
+					team2used.push(monTempName);
+					team2nicknames.push(newNick);
+				}
+			}
+		}
+
+		if (tokens[1] === '-terastallize') {
+			const idstuff = tokens[2].split(': ');
+			if (idstuff[0].includes('1')) {
+				for (const nick of team1nicknames) {
+					if (idstuff[1] === nick.nickname) {
+						p1TeraMon = nick.realName;
+						p1TeraType = tokens[3];
+					}
+				}
+			}
+			if (idstuff[0].includes('2')) {
+				for (const nick of team2nicknames) {
+					if (idstuff[1] === nick.nickname) {
+						p2TeraMon = nick.realName;
+						p2TeraType = tokens[3];
+					}
+				}
+			}
+		}
+
+		if (tokens[1] === '-mega') {
+			const idstuff = tokens[2].split(': ');
+			const monNick = idstuff[1];
+			const stone = tokens[4] ?? '';
+			let stoneSuffix = '';
+			if (stone.endsWith('X')) stoneSuffix = '-X';
+			if (stone.endsWith('Y')) stoneSuffix = '-Y';
+
+			if (idstuff[0].includes('1')) {
+				for (const nick of team1nicknames) {
+					if (monNick === nick.nickname) {
+						p1MegaMon = nick.realName + stoneSuffix + '-Mega';
+					}
+				}
+			}
+			if (idstuff[0].includes('2')) {
+				for (const nick of team2nicknames) {
+					if (monNick === nick.nickname) {
+						p2MegaMon = nick.realName + stoneSuffix + '-Mega';
+					}
+				}
+			}
+		}
+
+		if (tokens[1] === 'move') {
+			const idstuff = tokens[2].split(':');
+			const moveUser = tokens[2].split(': ')[1];
+			const moveName = tokens[3];
+			if (idstuff[0].includes('1')) p1Moves.addMove(moveUser, moveName);
+			if (idstuff[0].includes('2')) p2Moves.addMove(moveUser, moveName);
+		}
+
+		// Illusion (Zoroark): rewind to the prior -damage line to recover the
+		// decoy's identity, then swap the revealed mon into leads/used.
+		if (tokens[1] === 'replace') {
+			const monid = tokens[2].split(':')[0];
+			const illusionFormalName = tokens[3].split(',')[0];
+			let matchfound = false;
+			let newLogIndex = logIndex;
+			while (!matchfound && newLogIndex > 0) {
+				newLogIndex--;
+				const previousTokens = gameLog[newLogIndex].split('|');
+				if (
+					previousTokens[1] === '-damage' &&
+					monid === previousTokens[2].split(':')[0]
+				) {
+					const decoyNick = previousTokens[2].split(': ')[1];
+					matchfound = true;
+					if (monid.includes('1')) {
+						for (const nick of team1nicknames) {
+							if (decoyNick === nick.nickname) {
+								const decoyMon = nick.realName;
+								const leadIndex = team1leads.indexOf(decoyMon);
+								if (leadIndex > -1) {
+									team1leads.splice(leadIndex, 1);
+									team1leads.push(illusionFormalName);
+									team1used.push(decoyMon);
+								} else if (team1used.includes(decoyMon)) {
+									team1used.push(illusionFormalName);
+								}
+							}
+						}
+					}
+					if (monid.includes('2')) {
+						for (const nick of team2nicknames) {
+							if (decoyNick === nick.nickname) {
+								const decoyMon = nick.realName;
+								const leadIndex = team2leads.indexOf(decoyMon);
+								if (leadIndex > -1) {
+									team2leads.splice(leadIndex, 1);
+									team2leads.push(illusionFormalName);
+									team2used.push(decoyMon);
+								} else if (team2used.includes(decoyMon)) {
+									team2used.push(illusionFormalName);
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if (tokens[1] === 'win') {
+			const winner = tokens[2];
+			winoutp = winner === p1 ? 1 : 2;
+			if (winner === advantagePlayer) lastGameOfSet = true;
+		}
+		if (tokens[1] === 'rated') ladder = true;
+		if (tokens[1] === 'raw') {
+			const tempSplit = tokens[2].split("'s rating: ");
+			if (tempSplit.length > 1) {
+				hasELO = true;
+				const ratedPlayer = fixSpecialChars(tempSplit[0]);
+				const startRating = tempSplit[1].split(' ')[0];
+				const endRating = tokens[2].split('<strong>')[1].split('<')[0];
+				if (ratedPlayer === p1) {
+					p1StartELO = startRating;
+					p1EndELO = endRating;
+				} else if (ratedPlayer === p2) {
+					p2StartELO = startRating;
+					p2EndELO = endRating;
+				}
+			}
+		}
+		if (line.includes('has agreed to open team sheets')) numPlayersAgreeToOTS++;
+	}
+
+	if (numPlayersAgreeToOTS === 2) ots = true;
+	const bo3 = format.includes('(Bo3)');
+	if (bo3 && ladder) ots = true;
+
+	// suppress unused-variable warnings — tera is tracked but not output in PASRS 7
+	void p1TeraMon;
+	void p1TeraType;
+	void p2TeraMon;
+	void p2TeraType;
+
+	const output: Array<Cell | undefined> = [];
+
+	output.push(p1);
+	for (let i = 0; i < 6; i++) output.push(team1[i]);
+	output.push(p2);
+	for (let i = 0; i < 6; i++) output.push(team2[i]);
+	output.push(winoutp);
+
+	// Q-T: Mega slots (Tera was here in 4.3, now commented out in PASRS 7)
+	output.push(p1MegaMon);
+	output.push('');
+	output.push(p2MegaMon);
+	output.push('');
+
+	output.push(team1leads[0]);
+	output.push(team1leads[1]);
+	output.push(team2leads[0]);
+	output.push(team2leads[1]);
+
+	output.push(ots ? 'ots' : 'cts');
+
+	if (hasELO) {
+		output.push(p1StartELO, p2StartELO, p1EndELO, p2EndELO);
+	} else if (ladder) {
+		output.push('?', '?', '?', '?');
+	} else if (!ladder) {
+		output.push('---', '---', '---', '---');
+	} else {
+		output.push('', '', '', '');
+	}
+
+	// AD-AG: Bo3 metadata
+	if (bo3) {
+		output.push('true');
+		output.push(setGameCount);
+		if (hasELO) lastGameOfSet = true;
+		output.push(lastGameOfSet ? 'yes' : 'no');
+		output.push(timestamp);
+	} else {
+		output.push('', '', '', '');
+	}
+
+	// AH-AM: score placeholders + replay URL
+	output.push(`p1: ${setP1winCount}`);
+	output.push(alignLeftPlayer);
+	output.push('vs');
+	output.push(alignRightPlayer);
+	output.push(`p2: ${setP2winCount}`);
+	output.push(replayUrl);
+
+	output.push(team1used[0], team1used[1], team1used[2], team1used[3]);
+	output.push(team2used[0], team2used[1], team2used[2], team2used[3]);
+
+	output.push('P1 MOVES START');
+	for (const listing of p1Moves.playerMoveListings) {
+		for (const mc of listing.moveCounts) {
+			output.push(`${listing.pokemonName}:${mc.moveName}:${mc.moveCount}`);
+		}
+	}
+	output.push('P1 MOVES END');
+	output.push('P2 MOVES START');
+	for (const listing of p2Moves.playerMoveListings) {
+		for (const mc of listing.moveCounts) {
+			output.push(`${listing.pokemonName}:${mc.moveName}:${mc.moveCount}`);
+		}
+	}
+	output.push('P2 MOVES END');
+
+	return output.map((cell) => cell ?? '');
+}
+
+export function replayJsonUrl(url: string): string {
+	let replayUrl = url;
+	if (replayUrl.slice(-3) === '?p2') replayUrl = replayUrl.slice(0, -3);
+	return `${replayUrl}.json`;
+}
+// Faithful TypeScript port of the PASRS template's `TEAMDATAFROMPASTE` Apps
+// Script function. The "Usage Stats" dashboard reads the player's own team out
+// of the `Team Info From Paste` sheet, normally filled by
+// `=TRANSPOSE(TEAMDATAFROMPASTE(Paste))`. Like REPLAYTODATA this custom function
+// is lost on xlsx export, so the extension reproduces its output and writes it
+// down column A; the sheet's TRIM/VLOOKUP formulas then render the page.
+//
+// Output order (written down column A, A1 first), matching the formulas that
+// read it (name → A1, moves → A2..A5, tera (mon 1) → A31, nickname → A37):
+//   for each mon: name, move1, move2, move3, move4
+//   then every tera type
+//   then every nickname
+//   then the team title
+//
+// The input is the raw HTML of a pokepaste page (e.g. https://pokepast.es/xxxx).
+
+interface PasteMon {
+	name: string;
+	nickname: string;
+	tera: string;
+	moves: [string, string, string, string];
+}
+
+function fixSpecialChars(text: string): string {
+	return text
+		.replace(/&#39;/g, "'")
+		.replace(/&#34;/g, '"')
+		.replace(/&amp;/g, '&')
+		.replace(/&gt;/g, '>')
+		.replace(/&lt;/g, '<')
+		.replace(/&apos;/g, "'");
+}
+
+const TERA_TYPES = [
+	'normal',
+	'fighting',
+	'flying',
+	'poison',
+	'ground',
+	'rock',
+	'bug',
+	'ghost',
+	'steel',
+	'fire',
+	'water',
+	'grass',
+	'electric',
+	'psychic',
+	'ice',
+	'dragon',
+	'dark',
+	'fairy',
+	'stellar',
+	'Stellar',
+];
+
+// Recovers a tera type from text whose `type-…` span is missing.
+function correctTeraType(rawText: string): string {
+	for (const tera of TERA_TYPES) {
+		if (rawText.includes(tera)) {
+			return tera.charAt(0).toUpperCase() + tera.slice(1);
+		}
+	}
+	return rawText;
+}
+
+const MOVE_EXCEPTIONS = [
+	'Matcha Gotcha',
+	'Blood Moon',
+	'Ivy Cudgel',
+	'Syrup Bomb',
+	'Electro Shot',
+	'Thunderclap',
+	'Tachyon Cutter',
+	'Mighty Cleave',
+	'Psyblade',
+	'Hydro Steam',
+	'Supercell Slam',
+	'Burning Bulwark',
+	'Hard Press',
+	'Fickle Beam',
+	'Tera Starstorm',
+	'Dragon Cheer',
+	'Alluring Voice',
+	'Temper Flare',
+	'Psychic Noise',
+	'Upper Hand',
+	'Malignant Chain',
+];
+
+// Pokepaste doesn't wrap a handful of newer moves in a span; re-insert the
+// markup the parser keys off of.
+function patchMoveExceptions(rawText: string): string {
+	let returnText = rawText;
+	for (const move of MOVE_EXCEPTIONS) {
+		returnText = returnText.replace(
+			move,
+			`<span class="type-grass">-</span> ${move}  \n`,
+		);
+	}
+	return returnText;
+}
+
+const MON_EXCEPTIONS = [
+	'Munkidori',
+	'Okidogi',
+	'Fezandipiti',
+	'Dipplin',
+	'-Bloodmoon',
+	'-Hisui',
+	'-Cornerstone',
+	'-Wellspring',
+	'-Hearthflame',
+	'-Artisan',
+	'-Masterpiece',
+	'Overqwil',
+	'Walking Wake',
+	'Iron Leaves',
+	'Archaludon',
+	'Raging Bolt',
+	'Hydrapple',
+	'Gouging Fire',
+	'Iron Boulder',
+	'Iron Crown',
+	'Terapagos',
+	'Pecharunt',
+];
+
+function patchMonExceptions(rawText: string): string {
+	let returnText = rawText;
+	const firstSplit = returnText.split('</span>')[0];
+	for (const mon of MON_EXCEPTIONS) {
+		if (firstSplit.includes(mon)) {
+			returnText = `<span class="type-grass">${returnText.replace(
+				mon,
+				`${mon}</span>`,
+			)}`;
+		}
+	}
+	return returnText;
+}
+
+export function teamFromPaste(html: string): string[] {
+	const team: PasteMon[] = [];
+	const teamTitle = html.split('</title>')[0].split('<title>')[1] ?? '';
+	const monSplit = html.split('<pre>');
+
+	for (let monIndex = 1; monIndex < monSplit.length; monIndex++) {
+		let monException = false;
+		let currentMonLine = patchMonExceptions(monSplit[monIndex]);
+		if (currentMonLine !== monSplit[monIndex]) monException = true;
+
+		const beforeSpan = () => currentMonLine.split('</span>')[0];
+		const wrap = (token: string, type: string) => {
+			currentMonLine = `<span class="type-${type}">${currentMonLine.replace(
+				token,
+				`${token}</span>`,
+			)}`;
+			monException = true;
+		};
+
+		if (
+			beforeSpan().includes('Sinistcha') &&
+			!beforeSpan().includes('Sinistcha-')
+		)
+			wrap('Sinistcha', 'grass');
+		if (
+			beforeSpan().includes('Poltchageist') &&
+			!beforeSpan().includes('Poltchageist-')
+		)
+			wrap('Poltchageist', 'grass');
+		if (beforeSpan().includes('Alcremie-') && beforeSpan().includes('-Cream'))
+			wrap('Cream', 'fairy');
+		if (beforeSpan().includes('Alcremie-') && beforeSpan().includes('-Swirl'))
+			wrap('Swirl', 'fairy');
+		if (beforeSpan().includes('Ogerpon') && !beforeSpan().includes('Ogerpon-'))
+			wrap('Ogerpon', 'grass');
+
+		const monHeader = currentMonLine.split('</span>')[0];
+		let tempName = monHeader.split('>')[1];
+		let tempNick =
+			currentMonLine.charAt(0) === '<'
+				? monHeader.split('>')[1]
+				: monHeader.split(' (<span')[0];
+
+		if (monException) {
+			const garbo = tempName;
+			if (garbo.includes(' (')) {
+				tempName = garbo.split(' (')[1];
+				tempNick = garbo.split(' (')[0];
+			}
+		}
+		tempNick = fixSpecialChars(tempNick);
+
+		// Tera type — handle both the well-formed span and the broken variant.
+		const teraCorrectionInfo = currentMonLine.split(
+			'<span class="attr">Tera Type: </span>',
+		)[1];
+		let teraType: string;
+		if (teraCorrectionInfo === undefined) {
+			// Some pastes omit a Tera Type entirely.
+			teraType = '';
+		} else if (teraCorrectionInfo.charAt(0) === '<') {
+			const teraSplitInfo = currentMonLine.split(
+				'<span class="attr">Tera Type: </span><span class="type-',
+			);
+			teraType = teraSplitInfo[1].split('>')[1].split('<')[0];
+		} else {
+			teraType = correctTeraType(teraCorrectionInfo.split('<')[0]);
+		}
+
+		const moveFixText = patchMoveExceptions(currentMonLine);
+		const moveSplits = moveFixText.split('">-</span> ');
+		const moveAt = (i: number): string =>
+			i in moveSplits ? moveSplits[i].split('\n')[0] : '';
+		let m1 = moveAt(1);
+		let m2 = moveAt(2);
+		let m3 = moveAt(3);
+		let m4 = moveAt(4);
+
+		const fixSignatureMove = (replacement: string) => {
+			if (m1.includes('Iron Head')) m1 = replacement;
+			if (m2.includes('Iron Head')) m2 = replacement;
+			if (m3.includes('Iron Head')) m3 = replacement;
+			if (m4.includes('Iron Head')) m4 = replacement;
+		};
+		if (tempName === 'Zacian-Crowned') fixSignatureMove('Behemoth Blade');
+		if (tempName === 'Zamazenta-Crowned') fixSignatureMove('Behemoth Bash');
+
+		team.push({
+			name: tempName,
+			nickname: tempNick,
+			tera: teraType,
+			moves: [m1, m2, m3, m4],
+		});
+	}
+
+	const output: string[] = [];
+	const teras: string[] = [];
+	for (const mon of team) {
+		output.push(mon.name);
+		teras.push(mon.tera);
+		output.push(mon.moves[0], mon.moves[1], mon.moves[2], mon.moves[3]);
+	}
+	for (const tera of teras) output.push(tera);
+	for (const mon of team) output.push(mon.nickname);
+	output.push(teamTitle);
+	return output;
+}
+// Read the user's Showdown teams (from the client's global `Storage`) and turn a
+// chosen team into the column the PASRS `Team Info From Paste` sheet expects.
+// This runs in the page's main world (same as the showdown hook), where the
+// Showdown client globals (`Storage`, `Dex`) live — so we can use structured
+// team data directly instead of scraping a pokepaste's HTML.
+
+interface ShowdownSet {
+	name?: string;
+	species?: string;
+	moves?: string[];
+	teraType?: string;
+}
+
+interface ShowdownStorageLike {
+	teams?: Array<{
+		name?: string;
+		format?: string;
+		team?: string | ShowdownSet[];
+	}>;
+	unpackTeam?: (packed: string) => ShowdownSet[];
+}
+
+interface DexLike {
+	moves?: { get?: (x: string) => { name?: string } | undefined };
+	species?: { get?: (x: string) => { name?: string } | undefined };
+}
+
+export interface ShowdownTeam {
+	name: string;
+	format: string;
+	sets: ShowdownSet[];
+}
+
+// The list of teams from the Showdown teambuilder, newest first as stored.
+export function getShowdownTeams(): ShowdownTeam[] {
+	const storage = (window as unknown as { Storage?: ShowdownStorageLike })
+		.Storage;
+	const teams = storage?.teams;
+	if (!Array.isArray(teams)) return [];
+
+	return teams.map((entry, index) => {
+		let sets: ShowdownSet[] = [];
+		if (Array.isArray(entry.team)) {
+			sets = entry.team;
+		} else if (typeof entry.team === 'string' && storage?.unpackTeam) {
+			try {
+				sets = storage.unpackTeam(entry.team);
+			} catch {
+				sets = [];
+			}
+		}
+		return {
+			name: entry.name?.trim() || `Team ${index + 1}`,
+			format: entry.format ?? '',
+			sets,
+		};
+	});
+}
+
+// Build the `Team Info From Paste` column (written down column A), matching the
+// order TEAMDATAFROMPASTE produced: per mon [species, m1, m2, m3, m4], then all
+// tera types, then all nicknames, then the team title.
+export function buildTeamInfoColumn(
+	teamName: string,
+	sets: ShowdownSet[],
+): string[] {
+	const dex = (window as unknown as { Dex?: DexLike }).Dex;
+	const moveName = (move: string): string =>
+		(move && dex?.moves?.get?.(move)?.name) || move;
+	const speciesName = (species: string): string =>
+		(species && dex?.species?.get?.(species)?.name) || species;
+
+	const out: string[] = [];
+	const teras: string[] = [];
+	const nicks: string[] = [];
+
+	for (const set of sets) {
+		const species = speciesName(set.species || set.name || '');
+		out.push(species);
+		const moves = set.moves ?? [];
+		out.push(
+			moveName(moves[0] ?? ''),
+			moveName(moves[1] ?? ''),
+			moveName(moves[2] ?? ''),
+			moveName(moves[3] ?? ''),
+		);
+		teras.push(set.teraType ?? '');
+		// In-battle nickname (what appears in replays); falls back to species.
+		const nick = set.name && set.name !== set.species ? set.name : species;
+		nicks.push(nick);
+	}
+
+	for (const tera of teras) out.push(tera);
+	for (const nick of nicks) out.push(nick);
+	out.push(teamName);
+	return out;
+}
+import type { RoomReplay } from '../types/replay';
+import type { Settings } from '../types/settings';
+
+// Cross-context RPC (page <-> content script) for Google Sheets logging.
+//
+// The page-injected scripts (React panel, showdown hook) cannot use chrome.*,
+// and OAuth + the Sheets API can only run in the background service worker.
+// So requests hop: page --window.postMessage--> content script
+// --chrome.runtime.sendMessage--> background, and the response travels back the
+// same way. Each request carries a unique id so concurrent calls don't cross.
+export const SHEETS_REQUEST = 'pasrs:sheets-request' as const;
+export const SHEETS_RESPONSE = 'pasrs:sheets-response' as const;
+
+export type SheetsAction =
+	| 'auth'
+	| 'signout'
+	| 'status'
+	| 'log'
+	| 'team'
+	| 'create'
+	| 'spreadsheet';
+
+// A recorded replay to log. The extension fetches the replay, parses it, and
+// writes the result into the PASRS template's `Base Data` sheet (reproducing the
+// template's own `REPLAYTODATA` so its formula-driven dashboards render).
+export interface SheetsLogPayload {
+	url: string;
+	playerName: string; // Showdown username, set in HomePage G6 if empty
+}
+
+export interface SheetsRequestData {
+	spreadsheetId?: string;
+	sheetName?: string;
+	payload?: SheetsLogPayload;
+	// For the 'team' action, one of:
+	//  - teamData: the already-built `Team Info From Paste` column (from a chosen
+	//    Showdown team — preferred, no HTML parsing), or
+	//  - teamPasteUrl: a pokepaste URL the background fetches + parses.
+	teamData?: string[];
+	teamPasteUrl?: string;
+}
+
+export interface SheetsRequestMessage {
+	type: typeof SHEETS_REQUEST;
+	requestId: string;
+	action: SheetsAction;
+	data?: SheetsRequestData;
+}
+
+export interface SheetsResponse {
+	ok: boolean;
+	error?: string;
+	signedIn?: boolean;
+	// The spreadsheet actually used/created (so the UI can link to it).
+	spreadsheetId?: string;
+	spreadsheetUrl?: string;
+}
+
+export interface SheetsResponseMessage extends SheetsResponse {
+	type: typeof SHEETS_RESPONSE;
+	requestId: string;
+}
+
+let sheetsRequestCounter = 0;
+
+// Page-side: send a request to the background worker and await its response.
+export const sheetsRequest = (
+	action: SheetsAction,
+	data?: SheetsRequestData,
+	timeoutMs = 60000,
+): Promise<SheetsResponse> => {
+	const requestId = `${Date.now()}-${sheetsRequestCounter++}`;
+
+	return new Promise((resolve) => {
+		const cleanup = () => {
+			window.removeEventListener('message', handler);
+			clearTimeout(timer);
+		};
+
+		const handler = (event: MessageEvent) => {
+			if (event.source !== window) return;
+			const data = event.data as SheetsResponseMessage | undefined;
+			if (
+				!data ||
+				data.type !== SHEETS_RESPONSE ||
+				data.requestId !== requestId
+			) {
+				return;
+			}
+			cleanup();
+			resolve({
+				ok: data.ok,
+				error: data.error,
+				signedIn: data.signedIn,
+				spreadsheetId: data.spreadsheetId,
+				spreadsheetUrl: data.spreadsheetUrl,
+			});
+		};
+
+		const timer = setTimeout(() => {
+			cleanup();
+			resolve({ ok: false, error: 'Request timed out' });
+		}, timeoutMs);
+
+		window.addEventListener('message', handler);
+
+		const message: SheetsRequestMessage = {
+			type: SHEETS_REQUEST,
+			requestId,
+			action,
+			data,
+		};
+		window.postMessage(message, window.location.origin);
+	});
+};
+
+// Content-script side: handle requests coming from the page and post results
+// back. The handler typically forwards to the background service worker.
+export const onSheetsRequest = (
+	handler: (message: SheetsRequestMessage) => Promise<SheetsResponse>,
+) => {
+	const listener = (event: MessageEvent) => {
+		if (event.source !== window) return;
+		const data = event.data as SheetsRequestMessage | undefined;
+		if (!data || data.type !== SHEETS_REQUEST) return;
+
+		handler(data)
+			.then((response) => sendSheetsResponse(data.requestId, response))
+			.catch((error) =>
+				sendSheetsResponse(data.requestId, {
+					ok: false,
+					error: String(error),
+				}),
+			);
+	};
+	window.addEventListener('message', listener);
+	return () => window.removeEventListener('message', listener);
+};
+
+const sendSheetsResponse = (requestId: string, response: SheetsResponse) => {
+	const message: SheetsResponseMessage = {
+		type: SHEETS_RESPONSE,
+		requestId,
+		...response,
+	};
+	window.postMessage(message, window.location.origin);
+};
+
+export const EVENTS = {
+	FORMATS_UPDATED: 'pasrs:formats-updated',
+	SETTINGS_UPDATED: 'pasrs:settings-updated',
+	REPLAYS_UPDATED: 'pasrs:replays-updated',
+} as const;
+
+export interface FormatsUpdatedEvent extends CustomEvent {
+	detail: {
+		formats: string[];
+	};
+}
+
+export interface SettingsUpdatedEvent extends CustomEvent {
+	detail: {
+		settings: Settings;
+	};
+}
+
+export interface ReplaysUpdatedEvent extends CustomEvent {
+	detail: {
+		replays: RoomReplay[];
+	};
+}
+
+// Helper functions for dispatching events
+export const dispatchFormatsUpdated = (formats: string[]) => {
+	const event = new CustomEvent(EVENTS.FORMATS_UPDATED, {
+		detail: { formats },
+	});
+	window.dispatchEvent(event);
+};
+
+export const dispatchSettingsUpdated = (settings: Settings) => {
+	const event = new CustomEvent(EVENTS.SETTINGS_UPDATED, {
+		detail: { settings },
+	});
+	window.dispatchEvent(event);
+};
+
+export const dispatchReplaysUpdated = (replays: RoomReplay[]) => {
+	const event = new CustomEvent(EVENTS.REPLAYS_UPDATED, {
+		detail: { replays },
+	});
+	window.dispatchEvent(event);
+};
+
+// Helper functions for listening to events
+export const onFormatsUpdated = (callback: (formats: string[]) => void) => {
+	const handler = (event: FormatsUpdatedEvent) => {
+		callback(event.detail.formats);
+	};
+	window.addEventListener(EVENTS.FORMATS_UPDATED, handler as EventListener);
+	return () =>
+		window.removeEventListener(
+			EVENTS.FORMATS_UPDATED,
+			handler as EventListener,
+		);
+};
+
+export const onSettingsUpdated = (callback: (settings: Settings) => void) => {
+	const handler = (event: SettingsUpdatedEvent) => {
+		callback(event.detail.settings);
+	};
+	window.addEventListener(EVENTS.SETTINGS_UPDATED, handler as EventListener);
+	return () =>
+		window.removeEventListener(
+			EVENTS.SETTINGS_UPDATED,
+			handler as EventListener,
+		);
+};
+
+export const onReplaysUpdated = (callback: (replays: RoomReplay[]) => void) => {
+	const handler = (event: ReplaysUpdatedEvent) => {
+		callback(event.detail.replays);
+	};
+	window.addEventListener(EVENTS.REPLAYS_UPDATED, handler as EventListener);
+	return () =>
+		window.removeEventListener(
+			EVENTS.REPLAYS_UPDATED,
+			handler as EventListener,
+		);
+};
+import { ReplayRoomState } from '../../types/replay';
+import {
+	getFormatFromData,
+	getRoomIdFromData,
+	getRoomIdFromURL,
+	getUrlFromData,
+	getUserFromCookies,
+} from '../../utils/showdown-data-utils';
+import {
+	isBattleFormatMessage,
+	isBattleInitMessage,
+	isForfeitCommand,
+	isFormatMessage,
+	isLeaveViewCommand,
+	isReplayUploadedMessage,
+	isWinMessage,
+} from '../../utils/showdown-protocol-utils';
+import { copyToClipboardWithRetry } from '../browser/browser';
+import { onSettingsUpdated, sheetsRequest } from '../events';
+import { ReplaysManager } from '../storage/replays-manager';
+import { SettingsManager } from '../storage/settings-manager';
+import createPASRSRoom from './pasrs_room';
+import type { App } from './room';
+
+declare const app: App;
+
+const appReceive = app.receive.bind(app);
+const appSend = app.send.bind(app);
+const settingsManager = SettingsManager.getInstance();
+const replaysManager = new ReplaysManager();
+
+let currentSettings = settingsManager.getSettings();
+
+// Best-effort desktop notification (used to surface Google Sheets sync results
+// so a failed/misrouted write isn't silent).
+function notify(message: string): void {
+	try {
+		if (typeof Notification !== 'undefined') {
+			new Notification(message);
+		}
+	} catch {
+		// Notifications may be unavailable/denied; ignore.
+	}
+}
+
+onSettingsUpdated((settings) => {
+	currentSettings = settings;
+});
+
+app.receive = (data: string) => {
+	var settings = currentSettings;
+
+	if (isFormatMessage(data)) {
+		settingsManager.setCustomFormats(getFormatFromData(data));
+	}
+
+	if (!settings.active) {
+		appReceive(data);
+		return;
+	}
+
+	if (isBattleInitMessage(data)) {
+		replaysManager.addReplay(data);
+	}
+	if (isBattleFormatMessage(data)) {
+		replaysManager.updateFormatReplay(data);
+	}
+
+	if (settings.vgc_only || settings.use_custom_replay_filter) {
+		const roomId = getRoomIdFromData(data);
+		const room = replaysManager.getReplay(roomId);
+
+		if (settings.vgc_only) {
+			if (room && room.format && !room.format.toLowerCase().includes('vgc')) {
+				replaysManager.setRoomState(roomId, ReplayRoomState.Ignored);
+			}
+		} else if (settings.use_custom_replay_filter) {
+			var formats = settings.custom_replay_filter;
+			if (
+				room &&
+				room.format &&
+				formats?.length > 0 &&
+				!formats.some(
+					(format) => room.format?.toLowerCase() === format.toLowerCase(),
+				)
+			) {
+				replaysManager.setRoomState(roomId, ReplayRoomState.Ignored);
+			}
+		}
+	}
+
+	if (isWinMessage(data)) {
+		const roomId = getRoomIdFromData(data);
+		const roomState = replaysManager.getRoomState(roomId);
+		if (
+			roomState === ReplayRoomState.OnGoing ||
+			roomState === ReplayRoomState.Forfeited
+		) {
+			replaysManager.setRoomResult(roomId, data);
+
+			if (roomState !== ReplayRoomState.Forfeited) {
+				app.send('/savereplay', roomId);
+			}
+		}
+	}
+
+	if (isReplayUploadedMessage(data)) {
+		const url = getUrlFromData(data);
+		const roomId = getRoomIdFromURL(url);
+
+		if (replaysManager.getRoomState(roomId) !== ReplayRoomState.Recorded) {
+			replaysManager.updateReplayUrl(roomId, url);
+
+			if (replaysManager.getRoomState(roomId) === ReplayRoomState.Finished) {
+				if (settings.use_clipboard) {
+					copyToClipboardWithRetry(url, settings.notifications);
+				}
+
+				if (settings.log_to_sheets) {
+					sheetsRequest('log', {
+						spreadsheetId: settings.sheets_spreadsheet_id,
+						payload: { url, playerName: getUserFromCookies() ?? '' },
+					}).then((response) => {
+						if (response.ok) {
+							if (settings.notifications) {
+								notify('Game added to your PASRS tracker');
+							}
+						} else {
+							console.error(
+								'PASRS Helper: failed to log replay to Google Sheets',
+								response.error,
+							);
+							// Always surface a sheet failure — otherwise it's silent and
+							// the tracker just looks like it isn't updating.
+							const message = (response.error ?? '').includes(
+								'context invalidated',
+							)
+								? 'PASRS: reload the Showdown page to reconnect (extension was updated).'
+								: `PASRS: couldn't update sheet — ${response.error}`;
+							notify(message);
+						}
+					});
+				}
+
+				replaysManager.setRoomState(roomId, ReplayRoomState.Recorded);
+				return;
+			}
+		}
+	}
+
+	appReceive(data);
+};
+
+app.send = (data: string, roomId?: string) => {
+	const settings = currentSettings;
+
+	appSend(data, roomId);
+	if (
+		settings.active &&
+		isForfeitCommand(data) &&
+		roomId &&
+		replaysManager.getRoomState(roomId) === ReplayRoomState.OnGoing
+	) {
+		replaysManager.setRoomState(roomId, ReplayRoomState.Forfeited);
+		appSend('/savereplay', roomId);
+	}
+	if (isLeaveViewCommand(data)) {
+		setTimeout(createPASRSRoom, 0);
+	}
+};
+
+// poor mans await.
+// Indeed :(
+let roomTimer = setTimeout(function roomCreator() {
+	if (window.app) {
+		clearTimeout(roomTimer);
+		createPASRSRoom();
+	} else {
+		roomTimer = setTimeout(roomCreator, 250);
+	}
+}, 0);
+import { useCallback, useEffect, useState } from 'react';
+import styled from 'styled-components';
+import { sheetsRequest } from '../../lib/events';
+import type { SettingsKey } from '../../types/settings';
+import {
+	type ShowdownTeam,
+	buildTeamInfoColumn,
+	getShowdownTeams,
+} from '../../utils/showdown-teams';
+import { SettingsCheckbox } from './SettingsCheckBox';
+import { SettingsTextInput } from './SettingsTextInput';
+
+const SHEETS_GUIDE_URL =
+	'https://github.com/alchemistake/PASRS_helper/blob/main/.github/CONTRIBUTING.md#google-sheets-integration';
+
+const AuthRow = styled.div`
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 4px 13px;
+`;
+
+const AuthButton = styled.button`
+	padding: 3px 12px;
+	border: 1px solid #ccc;
+	border-radius: 4px;
+	background: transparent;
+	color: inherit;
+	cursor: pointer;
+	font-size: 0.85em;
+
+	&:hover:not(:disabled) {
+		border-color: var(--border-color);
+	}
+
+	&:disabled {
+		cursor: not-allowed;
+		opacity: 0.6;
+	}
+`;
+
+const StatusText = styled.span<{ $signedIn: boolean }>`
+	font-size: 0.8em;
+	opacity: 0.85;
+	color: ${({ $signedIn }) => ($signedIn ? '#3a9d3a' : 'inherit')};
+`;
+
+const ErrorText = styled.span`
+	padding: 0 13px;
+	font-size: 0.8em;
+	color: #c0392b;
+`;
+
+const HintText = styled.span`
+	padding: 4px 13px 0;
+	font-size: 0.8em;
+	opacity: 0.85;
+`;
+
+const GuideLink = styled.a`
+	padding: 4px 13px 0;
+	font-size: 0.8em;
+	opacity: 0.85;
+	text-decoration: underline;
+	cursor: pointer;
+`;
+
+const TeamSelect = styled.select`
+	flex: 1;
+	margin: 2px 13px;
+	padding: 3px 6px;
+	border: 1px solid #ccc;
+	border-radius: 4px;
+	font-size: 12px;
+	background: transparent;
+	color: inherit;
+
+	&:disabled {
+		cursor: not-allowed;
+		opacity: 0.6;
+	}
+`;
+
+interface SheetsSettingsProps {
+	logToSheets: boolean;
+	spreadsheetId: string;
+	teamPasteUrl: string;
+	onCheckboxChange: (key: SettingsKey, value: boolean) => void;
+	onTextChange: (key: SettingsKey, value: string) => void;
+}
+
+export function SheetsSettings({
+	logToSheets,
+	spreadsheetId,
+	teamPasteUrl,
+	onCheckboxChange,
+	onTextChange,
+}: SheetsSettingsProps) {
+	const [signedIn, setSignedIn] = useState(false);
+	const [busy, setBusy] = useState(false);
+	const [error, setError] = useState('');
+	const [sheetUrl, setSheetUrl] = useState('');
+	const [teamBusy, setTeamBusy] = useState(false);
+	const [teamStatus, setTeamStatus] = useState('');
+	const [creating, setCreating] = useState(false);
+	const [teams, setTeams] = useState<ShowdownTeam[]>([]);
+	const [selectedTeam, setSelectedTeam] = useState(0);
+
+	useEffect(() => {
+		setTeams(getShowdownTeams());
+	}, []);
+
+	const refreshSheet = useCallback(() => {
+		sheetsRequest('spreadsheet', { spreadsheetId }).then((res) => {
+			if (res.ok) setSheetUrl(res.spreadsheetUrl ?? '');
+		});
+	}, [spreadsheetId]);
+
+	useEffect(() => {
+		sheetsRequest('status').then((res) => {
+			if (res.ok) setSignedIn(!!res.signedIn);
+		});
+	}, []);
+
+	useEffect(() => {
+		refreshSheet();
+	}, [refreshSheet]);
+
+	const handleSignIn = async (): Promise<void> => {
+		setBusy(true);
+		setError('');
+		const res = await sheetsRequest('auth');
+		setBusy(false);
+		if (res.ok) {
+			setSignedIn(true);
+			refreshSheet();
+		} else {
+			setError(res.error || 'Sign-in failed');
+		}
+	};
+
+	const handleSignOut = async (): Promise<void> => {
+		setBusy(true);
+		setError('');
+		await sheetsRequest('signout');
+		setBusy(false);
+		setSignedIn(false);
+	};
+
+	const handleCreate = async (): Promise<void> => {
+		setCreating(true);
+		setError('');
+		const res = await sheetsRequest('create', undefined, 120000);
+		setCreating(false);
+		if (res.ok && res.spreadsheetId) {
+			onTextChange('sheets_spreadsheet_id', res.spreadsheetId);
+			setSheetUrl(res.spreadsheetUrl ?? '');
+		} else {
+			setError(res.error || 'Could not create tracker');
+		}
+	};
+
+	const handleUseTeam = async (): Promise<void> => {
+		const team = teams[selectedTeam];
+		if (!team) return;
+		setTeamBusy(true);
+		setTeamStatus('');
+		setError('');
+		const teamData = buildTeamInfoColumn(team.name, team.sets);
+		const res = await sheetsRequest('team', { spreadsheetId, teamData });
+		setTeamBusy(false);
+		if (res.ok) {
+			setTeamStatus('Team updated');
+		} else {
+			setError(res.error || 'Could not update team');
+		}
+	};
+
+	const handleSyncTeam = async (): Promise<void> => {
+		setTeamBusy(true);
+		setTeamStatus('');
+		setError('');
+		const res = await sheetsRequest('team', { spreadsheetId, teamPasteUrl });
+		setTeamBusy(false);
+		if (res.ok) {
+			setTeamStatus('Team updated');
+		} else {
+			setError(res.error || 'Could not update team');
+		}
+	};
+
+	return (
+		<>
+			<SettingsCheckbox
+				settingsKey="log_to_sheets"
+				label="Log recorded replays to Google Sheets"
+				checked={logToSheets}
+				onChange={onCheckboxChange}
+			/>
+
+			<AuthRow>
+				{signedIn ? (
+					<AuthButton type="button" onClick={handleSignOut} disabled={busy}>
+						Sign out
+					</AuthButton>
+				) : (
+					<AuthButton
+						type="button"
+						onClick={handleSignIn}
+						disabled={busy || !logToSheets}
+					>
+						Sign in with Google
+					</AuthButton>
+				)}
+				<StatusText $signedIn={signedIn}>
+					{signedIn ? 'Signed in' : 'Not signed in'}
+				</StatusText>
+			</AuthRow>
+
+			<SettingsTextInput
+				settingsKey="sheets_spreadsheet_id"
+				value={spreadsheetId}
+				placeholder="PASRS spreadsheet ID (or create one →)"
+				onChange={onTextChange}
+				disabled={!logToSheets}
+			/>
+
+			<AuthRow>
+				<AuthButton
+					type="button"
+					onClick={handleCreate}
+					disabled={creating || !logToSheets || !signedIn}
+				>
+					{creating ? 'Creating…' : 'Create tracker'}
+				</AuthButton>
+				<StatusText $signedIn={false}>
+					Makes a new PASRS sheet in your Drive
+				</StatusText>
+			</AuthRow>
+
+			<HintText>
+				{sheetUrl ? (
+					<>
+						Filling in your{' '}
+						<a href={sheetUrl} target="_blank" rel="noopener noreferrer">
+							PASRS tracker
+						</a>{' '}
+						from each recorded replay.
+					</>
+				) : (
+					'Click "Create tracker" to make a PASRS sheet automatically, or paste an existing spreadsheet ID.'
+				)}
+			</HintText>
+
+			<HintText>Set your team (fills the Usage Stats page):</HintText>
+
+			{teams.length > 0 ? (
+				<>
+					<TeamSelect
+						value={selectedTeam}
+						disabled={!logToSheets || teamBusy}
+						onChange={(e) => setSelectedTeam(Number(e.target.value))}
+					>
+						{teams.map((team, index) => (
+							<option key={`${team.name}-${index}`} value={index}>
+								{team.name}
+								{team.format ? ` (${team.format})` : ''}
+							</option>
+						))}
+					</TeamSelect>
+
+					<AuthRow>
+						<AuthButton
+							type="button"
+							onClick={handleUseTeam}
+							disabled={teamBusy || !logToSheets || !signedIn}
+						>
+							Use selected team
+						</AuthButton>
+						{teamStatus && (
+							<StatusText $signedIn={true}>{teamStatus}</StatusText>
+						)}
+					</AuthRow>
+				</>
+			) : (
+				<>
+					<SettingsTextInput
+						settingsKey="sheets_team_paste_url"
+						value={teamPasteUrl}
+						placeholder="Your team pokepaste URL (pokepast.es/…)"
+						onChange={onTextChange}
+						disabled={!logToSheets}
+					/>
+					<AuthRow>
+						<AuthButton
+							type="button"
+							onClick={handleSyncTeam}
+							disabled={teamBusy || !logToSheets || !signedIn || !teamPasteUrl}
+						>
+							Update team in sheet
+						</AuthButton>
+						{teamStatus && (
+							<StatusText $signedIn={true}>{teamStatus}</StatusText>
+						)}
+					</AuthRow>
+				</>
+			)}
+
+			{error && <ErrorText>{error}</ErrorText>}
+
+			<GuideLink
+				href={SHEETS_GUIDE_URL}
+				target="_blank"
+				rel="noopener noreferrer"
+			>
+				How to set this up
+			</GuideLink>
+		</>
+	);
+}
+export interface Settings {
+	active: boolean;
+	notifications: boolean;
+	vgc_only: boolean;
+	use_clipboard: boolean;
+	use_custom_replay_filter: boolean;
+	custom_replay_filter: string[];
+	clear_on_copy: boolean;
+	log_to_sheets: boolean;
+	sheets_spreadsheet_id: string;
+	sheets_sheet_name: string;
+	sheets_team_paste_url: string;
+}
+
+export type SettingsKey = keyof Settings;
+{
+	"name": "PASRS Helper",
+	"description": "Auto-saves your Pokémon Showdown replays and fills a PASRS Google Sheet with your stats — picks, leads, tera, Elo and matchups.",
+	"version": "1.2.3",
+	"manifest_version": 3,
+	"icons": {
+		"16": "icons/icon-16.png",
+		"32": "icons/icon-32.png",
+		"48": "icons/icon-48.png",
+		"96": "icons/icon-96.png",
+		"128": "icons/icon-128.png"
+	},
+	"permissions": ["storage", "identity"],
+	"host_permissions": [
+		"*://*.pokemonshowdown.com/*",
+		"*://*.psim.us/*",
+		"https://sheets.googleapis.com/*",
+		"https://www.googleapis.com/*",
+		"https://pokepast.es/*"
+	],
+	"oauth2": {
+		"client_id": "399755851205-l7i2g4jrqbgv9a8lsrqe8drbo1lqdg19.apps.googleusercontent.com",
+		"scopes": ["https://www.googleapis.com/auth/drive.file"]
+	},
+	"background": {
+		"service_worker": "dist/background.js"
+	},
+	"content_scripts": [
+		{
+			"matches": ["*://play.pokemonshowdown.com/*", "*://*.psim.us/*"],
+			"js": ["dist/extension.js"]
+		}
+	],
+	"web_accessible_resources": [
+		{
+			"resources": ["dist/*.js", "dist/*.css"],
+			"matches": ["*://play.pokemonshowdown.com/*", "*://*.psim.us/*"]
+		}
+	]
+}

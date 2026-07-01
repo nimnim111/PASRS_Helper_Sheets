@@ -110,6 +110,9 @@ export function replayToData(url: string, jsonText: string): Cell[] {
 	const setP2winCount = 0;
 	let advantagePlayer = '';
 	let lastGameOfSet = false;
+	// The replay JSON's `format` field frequently omits "(Bo3)" even for a best-of
+	// game, so we also treat the presence of a `bestof` box as proof it's a Bo3.
+	let sawBestof = false;
 
 	let p1 = '';
 	let p2 = '';
@@ -160,6 +163,7 @@ export function replayToData(url: string, jsonText: string): Cell[] {
 		}
 
 		if (tokens[1] === 'uhtml' && tokens[2] === 'bestof') {
+			sawBestof = true;
 			setGameCount = tokens[3]?.charAt(17) ?? '';
 			if (setGameCount === '3') lastGameOfSet = true;
 		}
@@ -326,7 +330,7 @@ export function replayToData(url: string, jsonText: string): Cell[] {
 	}
 
 	if (numPlayersAgreeToOTS === 2) ots = true;
-	const bo3 = format.includes('(Bo3)');
+	const bo3 = format.includes('(Bo3)') || sawBestof;
 	if (bo3 && ladder) ots = true;
 
 	// suppress unused-variable warnings — Tera tracked but Champions format outputs
@@ -411,4 +415,34 @@ export function replayJsonUrl(url: string): string {
 	let replayUrl = url;
 	if (replayUrl.slice(-3) === '?p2') replayUrl = replayUrl.slice(0, -3);
 	return `${replayUrl}.json`;
+}
+
+export interface ReplayPlayers {
+	p1: string;
+	p2: string;
+	team1: string[];
+	team2: string[];
+}
+
+// Lightweight parse of just the player names and their team-preview species, so
+// the caller can tell which side (and which team) the signed-in user played.
+export function replayPlayers(jsonText: string): ReplayPlayers {
+	const replay = JSON.parse(jsonText) as ReplayJson;
+	const gameLog = (replay.log ?? '').split('\n');
+	let p1 = '';
+	let p2 = '';
+	const team1: string[] = [];
+	const team2: string[] = [];
+	for (const line of gameLog) {
+		const tokens = line.split('|');
+		if (tokens[1] === 'player') {
+			if (tokens[2] === 'p1' && p1 === '') p1 = tokens[3];
+			else if (tokens[2] === 'p2' && p2 === '') p2 = tokens[3];
+		}
+		if (tokens[1] === 'poke') {
+			if (tokens[2] === 'p1') team1.push(tokens[3].split(',')[0]);
+			else if (tokens[2] === 'p2') team2.push(tokens[3].split(',')[0]);
+		}
+	}
+	return { p1, p2, team1, team2 };
 }

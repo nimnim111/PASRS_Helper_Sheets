@@ -17,6 +17,7 @@ import {
 } from '../../utils/showdown-protocol-utils';
 import { copyToClipboardWithRetry } from '../browser/browser';
 import { onSettingsUpdated, sheetsRequest } from '../events';
+import { getTeamCandidates } from '../../utils/showdown-teams';
 import { ReplaysManager } from '../storage/replays-manager';
 import { SettingsManager } from '../storage/settings-manager';
 import createPASRSRoom from './pasrs_room';
@@ -117,9 +118,16 @@ app.receive = (data: string) => {
 				}
 
 				if (settings.log_to_sheets) {
+					let availableTeams: ReturnType<typeof getTeamCandidates> = [];
+					try {
+						availableTeams = getTeamCandidates();
+					} catch {
+						availableTeams = [];
+					}
 					sheetsRequest('log', {
 						spreadsheetId: settings.sheets_spreadsheet_id,
 						payload: { url, playerName: getUserFromCookies() ?? '' },
+						availableTeams,
 					}).then((response) => {
 						if (response.ok) {
 							if (settings.notifications) {

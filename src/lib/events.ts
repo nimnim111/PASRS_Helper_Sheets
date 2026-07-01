@@ -38,6 +38,14 @@ export interface SheetsRequestData {
 	//  - teamPasteUrl: a pokepaste URL the background fetches + parses.
 	teamData?: string[];
 	teamPasteUrl?: string;
+	// For the 'team' action, an explicit team identifier to key the tracker by.
+	teamId?: string;
+	// Human-friendly team name, used in the tracker's title.
+	teamName?: string;
+	// For the 'log' action: the user's teambuilder teams (identifier + built
+	// column). The background matches the replay's team to one of these so it can
+	// pick/create the right per-team tracker and auto-fill the team section.
+	availableTeams?: Array<{ id: string; name: string; column: string[] }>;
 }
 
 export interface SheetsRequestMessage {

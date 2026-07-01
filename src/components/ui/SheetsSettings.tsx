@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import styled from 'styled-components';
 import { sheetsRequest } from '../../lib/events';
+import { teamIdentifier } from '../../lib/sheets/team-id';
 import type { SettingsKey } from '../../types/settings';
 import {
 	type ShowdownTeam,
@@ -167,7 +168,15 @@ export function SheetsSettings({
 		setTeamStatus('');
 		setError('');
 		const teamData = buildTeamInfoColumn(team.name, team.sets);
-		const res = await sheetsRequest('team', { spreadsheetId, teamData });
+		const teamId = teamIdentifier(
+			team.sets.map((s) => s.species || s.name || '').filter(Boolean),
+		);
+		const res = await sheetsRequest('team', {
+			spreadsheetId,
+			teamData,
+			teamId,
+			teamName: team.name,
+		});
 		setTeamBusy(false);
 		if (res.ok) {
 			setTeamStatus('Team updated');

@@ -4,6 +4,8 @@
 // Showdown client globals (`Storage`, `Dex`) live — so we can use structured
 // team data directly instead of scraping a pokepaste's HTML.
 
+import { teamIdentifier } from '../lib/sheets/team-id';
+
 interface ShowdownSet {
 	name?: string;
 	species?: string;
@@ -110,4 +112,28 @@ export function buildTeamInfoColumn(
 	}
 	void teamName; // team title not used in PASRS 7 column A
 	return out;
+}
+
+export interface TeamCandidate {
+	id: string;
+	name: string;
+	column: string[];
+}
+
+// Every teambuilder team as {identifier, name, filled column}, so the background
+// can auto-match the team used in a replay and fill the tracker without the user
+// picking one manually. The identifier is derived from the team's species.
+export function getTeamCandidates(): TeamCandidate[] {
+	return getShowdownTeams()
+		.map((team) => {
+			const species = team.sets
+				.map((s) => s.species || s.name || '')
+				.filter(Boolean);
+			return {
+				id: teamIdentifier(species),
+				name: team.name,
+				column: buildTeamInfoColumn(team.name, team.sets),
+			};
+		})
+		.filter((c) => c.id !== '');
 }
